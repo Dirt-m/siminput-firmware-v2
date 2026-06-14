@@ -1,0 +1,7 @@
+.claude/
+__pycache__/
+*.pyc
+.env
+siminput-firmware-*.zip
+siminput-firmware-*/
+manifest.json

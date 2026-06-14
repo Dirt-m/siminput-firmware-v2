@@ -1,0 +1,28 @@
+{
+    "device": {
+        "name": "My Button Box",
+        "pid": 61440,
+        "inactivity_refresh": 1.0,
+        "debounce_ms": 10
+    },
+    "bools": [
+        { "id": "TOGGLE1", "default": false, "store": true }
+    ],
+    "axes": [
+        { "id": "AX1", "output": 1, "default": 32767, "store": true, "backlight": true }
+    ],
+    "rules": [
+        { "type": "MAP", "input": "D1", "output": "B50", "invert": true },
+
+        { "type": "NOR", "inputs": ["D3", "D4"], "output": "B30" },
+
+        { "type": "TOGGLE", "input": "D5", "output": "TOGGLE1" },
+        { "type": "MAP", "input": "TOGGLE1", "output": "B100" },
+
+        { "type": "PULSE", "input": "D8", "output": "B8", "delay_ms": 0, "pulse_ms": 100 },
+
+        { "type": "ENCODER", "inputs": ["D17", "D18"], "cw": "B17", "ccw": "B18" },
+        { "type": "AXIS_INC", "input": "B17", "axis": "AX1", "step": 2048 },
+        { "type": "AXIS_DEC", "input": "B18", "axis": "AX1", "step": 2048 }
+    ]
+}

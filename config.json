@@ -1,0 +1,11 @@
+{
+    "device": {
+        "name": "SimInput Box",
+        "pid": 61440,
+        "inactivity_refresh": 1.0,
+        "debounce_ms": 10
+    },
+    "bools": [],
+    "axes": [],
+    "rules": []
+}
