@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="2.4.0"
+VERSION="2.4.1"
 OUT="siminput-firmware-${VERSION}.zip"
 
 # Generate manifest. Lists every file the OTA updater should push.
@@ -18,8 +18,10 @@ files = []
 for f in ['code.py', 'boot.py']:
     files.append(hash_file(f))
 for root, dirs, fnames in sorted(os.walk('lib')):
-    dirs.sort()
+    dirs[:] = sorted(d for d in dirs if d != '__pycache__')
     for f in sorted(fnames):
+        if f.endswith(('.pyc', '.pyo')):
+            continue
         files.append(hash_file(os.path.join(root, f)))
 
 manifest = {
@@ -30,7 +32,7 @@ json.dump(manifest, open('manifest.json', 'w'), indent=2)
 "
 
 rm -f "$OUT"
-zip -r "$OUT" manifest.json code.py boot.py lib/
+zip -r "$OUT" manifest.json code.py boot.py lib/ -x "lib/__pycache__/*" "*.pyc" "*.pyo"
 rm -f manifest.json
 
 echo "Built $OUT"

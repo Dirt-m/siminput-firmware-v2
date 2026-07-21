@@ -7,12 +7,13 @@ import sys
 import microcontroller
 import supervisor
 
-FW_VERSION = "2.4.0"
+FW_VERSION = "2.4.1"
 
 _MAX_LINE = 4096
 _CHUNK_SIZE = 2048
 _CHUNK_TIMEOUT = 30.0
 _STREAM_MIN_MS = 20
+_MAX_CONFIG = 32768
 
 _ALLOWED_WRITE_PATHS = {"config.json", "code.py", "boot.py"}
 _ALLOWED_WRITE_PREFIXES = ("lib/",)
@@ -453,8 +454,8 @@ class SerialHandler:
     def _cmd_set_config(self, msg):
         if msg.get("chunked"):
             size = msg.get("size", 0)
-            if not isinstance(size, int) or size < 1 or size > 65536:
-                self._send({"ok": False, "error": "invalid size"})
+            if not isinstance(size, int) or size < 1 or size > _MAX_CONFIG:
+                self._send({"ok": False, "error": "invalid size (max %d)" % _MAX_CONFIG})
                 return
             self._start_chunk_receive("set_config", size, msg)
             return
@@ -473,8 +474,8 @@ class SerialHandler:
     def _cmd_validate_config(self, msg):
         if msg.get("chunked"):
             size = msg.get("size", 0)
-            if not isinstance(size, int) or size < 1 or size > 65536:
-                self._send({"ok": False, "error": "invalid size"})
+            if not isinstance(size, int) or size < 1 or size > _MAX_CONFIG:
+                self._send({"ok": False, "error": "invalid size (max %d)" % _MAX_CONFIG})
                 return
             self._start_chunk_receive("validate_config", size, msg)
             return
@@ -564,6 +565,18 @@ class SerialHandler:
             self._send({"ok": False, "error": "no update in progress"})
             return
         staged = self._list_staged_files(".update")
+        # Commit in dependency order (lib, then boot.py, then code.py) so an
+        # interrupted commit never leaves a new code.py next to old libs.
+        def _commit_rank(item):
+            path = item[1]
+            if path.startswith("lib/"):
+                return 0
+            if path == "boot.py":
+                return 2
+            if path == "code.py":
+                return 3
+            return 1
+        staged = sorted(staged, key=_commit_rank)
         committed = []
         try:
             for staged_path, real_path in staged:
@@ -575,10 +588,9 @@ class SerialHandler:
                 os.rename(staged_path, real_path)
                 committed.append(real_path)
         except OSError as e:
-            for done_path in committed:
-                # Best-effort rollback: can't undo renames that already landed,
-                # but the device will reboot cleanly on its previous firmware.
-                pass
+            # Renames that already landed can't be undone, but the device
+            # reboots cleanly on whatever mix is on flash: code.py went last,
+            # so a partial commit never runs new code against old libs.
             self._rmtree(".update")
             self._update_mode = False
             gc.collect()
@@ -666,7 +678,11 @@ class SerialHandler:
             self._chunk_buf = None
             self._chunk_pos = 0
         else:
-            self._chunk_buf = bytearray(min(size + 256, 8192))
+            # Size is pre-validated against _MAX_CONFIG by the command handlers.
+            # The buffer must hold the full declared size: anything smaller makes
+            # every transfer past the cap fail with "data exceeds declared size".
+            gc.collect()
+            self._chunk_buf = bytearray(size + 256)
             self._chunk_pos = 0
             self._chunk_file = None
 
@@ -826,6 +842,8 @@ class SerialHandler:
             return ""
 
     def _is_writable_path(self, path):
+        if not isinstance(path, str) or ".." in path.split("/"):
+            return False
         if path in _ALLOWED_WRITE_PATHS:
             return True
         for prefix in _ALLOWED_WRITE_PREFIXES:
