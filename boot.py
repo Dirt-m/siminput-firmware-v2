@@ -14,11 +14,19 @@ _name = "SimInput Button Box"
 _vid  = 0x239A   # Adafruit VID — fine for personal/custom projects
 _pid  = 0xF000   # Default SIMINPUT PID, distinct from any CircuitPython default
 
+# Validate before use: a malformed config.json must never push the device onto
+# CircuitPython's default identity (PID 0x80F4) or a broken descriptor string —
+# fall back to the SIMINPUT defaults above instead.
 try:
     with open("config.json") as _f:
-        _dev  = json.load(_f).get("device", {})
-        _name = _dev.get("name", _name)
-        _pid  = _dev.get("pid",  _pid)
+        _dev = json.load(_f).get("device", {})
+    _n = _dev.get("name")
+    if isinstance(_n, str) and 0 < len(_n) <= 32:
+        _name = _n
+    _p = _dev.get("pid")
+    if (isinstance(_p, int) and not isinstance(_p, bool)
+            and 1 <= _p <= 0xFFFF and _p != 0x80F4):
+        _pid = _p
 except Exception:
     pass
 
@@ -94,7 +102,22 @@ except Exception as e:
     print("set_interface_name failed (requires CircuitPython 9.0.2+):", e)
 
 usb_cdc.enable(console=True, data=True)
-storage.disable_usb_drive()
-storage.remount("/", readonly=False)
+try:
+    storage.disable_usb_drive()
+except Exception as e:
+    print("disable_usb_drive failed:", e)
+try:
+    storage.remount("/", readonly=False)
+except Exception as e:
+    print("remount failed:", e)
+
+# Finish any OTA replacement that was interrupted by power loss. Must run
+# after the remount (needs a writable filesystem) and is fully self-guarded:
+# a failure here logs and boots normally.
+try:
+    from update_recovery import recover
+    recover()
+except Exception as e:
+    print("update recovery failed:", e)
 
 usb_hid.enable((_gamepad,))

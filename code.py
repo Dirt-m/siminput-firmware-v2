@@ -12,18 +12,14 @@ import supervisor
 from community_tca9555 import TCA9555
 from serial_handler import SerialHandler
 
+# Finish or clean up any interrupted OTA update. boot.py already ran this,
+# but running it again here is idempotent and covers the transitional case of
+# a new code.py under an old boot.py.
 try:
-    def _rmtree(path):
-        for entry in os.listdir(path):
-            full = path + "/" + entry
-            try:
-                os.remove(full)
-            except OSError:
-                _rmtree(full)
-        os.rmdir(path)
-    _rmtree(".update")
-except OSError:
-    pass
+    from update_recovery import recover
+    recover()
+except Exception as e:
+    print("update recovery failed:", e)
 
 
 def _gpio_pin(n):
@@ -122,8 +118,11 @@ class NVMStorage:
         available = len(nvm) - NVM_HDR
 
         # Silently truncate if more storage is requested than NVM can hold.
-        max_bools    = min(len(stored_bools), available)
-        max_axes     = min(len(stored_axes),  (available - max_bools) // 2)
+        # The 255 cap matches the single-byte item counts in the header —
+        # without it, byte 1/2 assignment below raises and the whole config
+        # gets discarded by the parse fallback.
+        max_bools    = min(len(stored_bools), available, 255)
+        max_axes     = min(len(stored_axes),  (available - max_bools) // 2, 255)
         stored_bools = stored_bools[:max_bools]
         stored_axes  = stored_axes[:max_axes]
 
@@ -348,9 +347,13 @@ class ButtonBox:
                 continue
             aid    = a["id"]
             output = a.get("output", 1)
+            try:
+                default = int(a.get("default", 32767))
+            except (TypeError, ValueError):
+                default = 32767
             self.axis_states[aid] = (self.nvm.read_axis(aid)
                                      if a.get("store", False)
-                                     else a.get("default", 32767))
+                                     else default)
             if str(output).upper() == "BACKLIGHT":
                 self.axis_output_slot[aid] = None
                 self.backlight_axis        = aid
@@ -663,7 +666,9 @@ class ButtonBox:
                 continue
             val = self.axis_states.get(axis_id, 32767)
             val += (steps * step) if is_inc else -(steps * step)
-            self.axis_states[axis_id] = max(0, min(65535, val))
+            # int(): a float step (possible in a hand-edited config) must not
+            # poison axis_states — _build_report's byte math needs ints.
+            self.axis_states[axis_id] = int(max(0, min(65535, val)))
             if axis_id in self.stored_axis_ids:
                 self.nvm.write_axis(axis_id, self.axis_states[axis_id])
 
@@ -783,7 +788,7 @@ class ButtonBox:
                     step = rule.get("step", 1)
                     val  = self.axis_states.get(axis_id, 32767)
                     val  = min(65535, val + step) if rtype == "AXIS_INC" else max(0, val - step)
-                    self.axis_states[axis_id] = val
+                    self.axis_states[axis_id] = int(val)
                     if axis_id in self.stored_axis_ids:
                         self.nvm.write_axis(axis_id, val)
                 self.rule_prev_input[i] = curr
@@ -939,8 +944,31 @@ class ButtonBox:
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+# The loop body is guarded: one bad config value or transient hardware error
+# must not end code.py, because boot.py disables the USB drive and a dead
+# code.py would leave the desktop app with no way to push a fix. After
+# repeated consecutive failures the box falls back to a serial-only loop that
+# keeps OTA recovery reachable.
 button_box = ButtonBox()
+_fail_streak = 0
 while True:
-    # update() owns the 200 Hz cadence itself — it either sleeps the remainder
-    # of the cycle or tight-polls software encoders when any are configured.
-    button_box.update()
+    try:
+        # update() owns the 200 Hz cadence itself — it either sleeps the
+        # remainder of the cycle or tight-polls software encoders.
+        button_box.update()
+        _fail_streak = 0
+    except Exception as e:
+        _fail_streak += 1
+        if _fail_streak <= 3 or _fail_streak % 200 == 0:
+            print("update() failed (%d):" % _fail_streak, e)
+        if _fail_streak >= 200:
+            break
+        time.sleep(0.005)
+
+print("main loop abandoned — serial-only recovery mode")
+while True:
+    try:
+        button_box.serial.process()
+    except Exception:
+        pass
+    time.sleep(0.01)
