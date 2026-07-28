@@ -8,22 +8,23 @@ Part of the open SIMINPUT ecosystem. The firmware, hardware, enclosure CAD, and 
 
 ## Features
 
-- **27 physical inputs.** 14 through the I2C expander, 10 direct GPIO, 3 ADC capable.
+- **Up to 42 physical inputs** depending on board revision (see Hardware below).
 - **Rule engine.** MAP, NOR, TOGGLE, PULSE, ENCODER, AXIS_INC, AXIS_DEC.
 - **Rotary encoders.** Hardware decoding (rotaryio/PIO) with automatic software fallback.
 - **Persistent storage.** Bools and axis values survive across power cycles using NVM.
 - **PWM backlight.** Perceptual brightness curve, driven by any axis.
-- **Fast loop.** 200 Hz main loop with sub millisecond encoder polling.
+- **Fast loop.** 200 Hz main loop; GPIO encoders poll at sub millisecond rate, expander encoders at roughly 1 ms per sample (I2C bound).
 - **Serial protocol.** JSON over USB CDC for configuration and live monitoring.
-- **OTA updates.** Firmware files push over serial, so there's no manual file copying.
-- **Auto detection.** Probes I2C at boot to pick the correct pin map for the board revision.
+- **OTA updates.** Firmware files push over serial with power-loss-safe installs and verified transfers.
+- **Auto detection.** Probes I2C at boot to pick the correct pin map for the board revision. A missing expander degrades to GPIO-only inputs and is reported over serial instead of disabling the box.
 
 ## Hardware
 
 - **MCU:** Raspberry Pi Pico (RP2040)
 - **I/O expander:** TCA9555 on I2C (address 0x20)
-- **Backlight:** PWM on GP12 (1 kHz)
-- All inputs use internal pull-ups, active low (switch closes to GND).
+- **rev1:** 27 inputs. D1 to D14 on the expander, D15 to D24 direct GPIO, A6 to A8. Backlight PWM on GP12.
+- **rev2:** 42 inputs. D1 to D22 direct GPIO, A1 to A4, D23 to D38 on the expander. Backlight PWM on GP2.
+- All inputs use internal pull-ups, active low (switch closes to GND). A-pins are read as digital inputs like the D-pins, but they are not part of the default passthrough: use them as explicit rule inputs.
 
 ## Project layout
 
@@ -46,6 +47,8 @@ lib/
 1. Install [CircuitPython 9.x](https://circuitpython.org/board/raspberry_pi_pico/) on your Pico.
 2. Copy all files to the CIRCUITPY drive: `boot.py`, `code.py`, `config.json`, and the `lib/` folder.
 3. The device shows up as a USB joystick with 128 buttons and 8 axes.
+
+Note: after the first boot the CIRCUITPY drive is disabled (the box presents as a clean joystick, not a flash drive). From then on, configuration and firmware updates go over the serial protocol via the desktop configurator. To get the drive back for manual file access, reflash CircuitPython over BOOTSEL or use the REPL on the console serial port.
 
 Every pin passes through as a button by default (D1 to B1, D2 to B2, and so on), so nothing needs configuring to get going. Edit `config.json` to add rules, encoders, axes, and toggles.
 
@@ -149,13 +152,16 @@ The device exposes a second USB CDC serial port for configuration and monitoring
 | `stream_stop` | Stop live streaming |
 | `file_write` | Write a file to the device (for firmware updates) |
 | `file_read` | Read a file from the device |
-| `reboot` | Soft reboot |
+| `reboot` | Soft reboot (`{"hard": true}` for a full chip reset that re-runs boot.py) |
 | `bootloader` | Enter UF2 bootloader mode |
+| `update_begin` / `update_commit` / `update_abort` | Staged (transactional) firmware updates |
+
+Requests may carry an `"id"` field, echoed on the reply. `get_info` reports the protocol revision, capabilities, transfer limits, and the board's pin list.
 
 Example:
 ```
 -> {"cmd": "ping"}
-<- {"ok": true, "product": "SIMINPUT", "version": "2.4.0", "name": "My Button Box", "pid": 61440}
+<- {"ok": true, "product": "SIMINPUT", "version": "2.6.0", "protocol": 2, "name": "My Button Box", "pid": 61440, "board_map": "rev2"}
 ```
 
 ## Firmware packaging

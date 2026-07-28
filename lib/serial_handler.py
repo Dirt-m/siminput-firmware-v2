@@ -7,13 +7,25 @@ import sys
 import microcontroller
 import supervisor
 
-FW_VERSION = "2.5.0"
+FW_VERSION = "2.6.0"
+PROTOCOL = 2
 
 _MAX_LINE = 4096
 _CHUNK_SIZE = 2048
-_CHUNK_TIMEOUT = 30.0
+_CHUNK_TIMEOUT_MS = 30000
 _STREAM_MIN_MS = 20
 _MAX_CONFIG = 32768
+
+# supervisor.ticks_ms wraps at 2**29; use ticks_diff for every comparison.
+# time.monotonic is unusable for firmware timing: CircuitPython floats are
+# single precision, so its resolution decays to worse than a full cycle
+# after ~9 hours of uptime.
+_TICKS_PERIOD = 1 << 29
+_TICKS_HALF = 1 << 28
+
+
+def ticks_diff(a, b):
+    return ((a - b + _TICKS_HALF) % _TICKS_PERIOD) - _TICKS_HALF
 
 _ALLOWED_WRITE_PATHS = {"config.json", "code.py", "boot.py"}
 _ALLOWED_WRITE_PREFIXES = ("lib/",)
@@ -251,11 +263,12 @@ class SerialHandler:
         self._update_mode = False
 
         self._streaming = False
-        self._stream_interval = 0.05
-        self._stream_last = 0.0
+        self._stream_interval_ms = 50
+        self._stream_last = 0
         self._stream_prev_btns = None
         self._stream_prev_axes = None
         self._stream_prev_pins = None
+        self._reply_id = None
 
         try:
             import usb_cdc
@@ -304,7 +317,7 @@ class SerialHandler:
 
     def _process_inner(self):
         if self._chunk_op is not None:
-            if time.monotonic() > self._chunk_deadline:
+            if ticks_diff(supervisor.ticks_ms(), self._chunk_deadline) > 0:
                 self._abort_chunk("timeout: transfer abandoned after 30s")
                 return
 
@@ -341,8 +354,8 @@ class SerialHandler:
         if self._chunk_op is not None:
             return  # never interleave stream frames with a chunked transfer
 
-        now = time.monotonic()
-        if now - self._stream_last < self._stream_interval:
+        now = supervisor.ticks_ms()
+        if ticks_diff(now, self._stream_last) < self._stream_interval_ms:
             return
         # Re-arm before the change check, so an idle box pays the comparison
         # at the stream interval instead of every 5 ms cycle.
@@ -392,6 +405,8 @@ class SerialHandler:
         """Write one JSON line. Returns False on a failed or partial write
         (host not reading), so stream callers can stop rather than desync."""
         try:
+            if self._reply_id is not None and "id" not in obj:
+                obj["id"] = self._reply_id
             data = json.dumps(obj).encode("utf-8") + b"\n"
             n = self._data.write(data)
             if n is not None and n < len(data):
@@ -415,27 +430,36 @@ class SerialHandler:
             self._send({"ok": False, "error": "expected JSON object"})
             return
 
-        if self._chunk_op is not None:
-            self._handle_chunk_msg(msg)
-            return
-
-        cmd = msg.get("cmd")
-        if cmd is None:
-            self._send({"ok": False, "error": "missing 'cmd' field"})
-            return
-        if not isinstance(cmd, str):
-            self._send({"ok": False, "error": "'cmd' must be a string"})
-            return
-
-        handler = getattr(self, "_cmd_" + cmd, None)
-        if handler is None:
-            self._send({"ok": False, "error": "unknown command: " + str(cmd)})
-            return
+        # Optional request id: echoed on every reply this line produces, so
+        # the host can correlate responses instead of trusting read order.
+        rid = msg.get("id")
+        if isinstance(rid, (int, str)):
+            self._reply_id = rid
 
         try:
-            handler(msg)
-        except Exception as e:
-            self._send({"ok": False, "error": str(e)})
+            if self._chunk_op is not None:
+                self._handle_chunk_msg(msg)
+                return
+
+            cmd = msg.get("cmd")
+            if cmd is None:
+                self._send({"ok": False, "error": "missing 'cmd' field"})
+                return
+            if not isinstance(cmd, str):
+                self._send({"ok": False, "error": "'cmd' must be a string"})
+                return
+
+            handler = getattr(self, "_cmd_" + cmd, None)
+            if handler is None:
+                self._send({"ok": False, "error": "unknown command: " + str(cmd)})
+                return
+
+            try:
+                handler(msg)
+            except Exception as e:
+                self._send({"ok": False, "error": str(e)})
+        finally:
+            self._reply_id = None
 
     # ------------------------------------------------------------------
     # Commands
@@ -447,6 +471,7 @@ class SerialHandler:
             "ok": True,
             "product": "SIMINPUT",
             "version": FW_VERSION,
+            "protocol": PROTOCOL,
             "name": dev.get("name", "SimInput Button Box"),
             "pid": dev.get("pid", 0xF000),
             "board_map": self._box.board_map.get("name", "unknown"),
@@ -479,6 +504,7 @@ class SerialHandler:
             "name": dev.get("name", "SimInput Button Box"),
             "pid": dev.get("pid", 0xF000),
             "version": FW_VERSION,
+            "protocol": PROTOCOL,
             "circuitpython": cp_version,
             "board": board_id,
             "nvm_size": nvm_size,
@@ -487,6 +513,10 @@ class SerialHandler:
             "rules_count": len(self._box.rules),
             "board_map": self._box.board_map.get("name", "unknown"),
             "hash": self._hash_algo,
+            "caps": ["staged_update", "hard_reboot", "stream", "chunked_config", "request_id"],
+            "limits": {"max_line": _MAX_LINE, "chunk": _CHUNK_SIZE, "max_config": _MAX_CONFIG},
+            "pins": sorted(self._box.pin_names),
+            "fault": getattr(self._box, "fault", ""),
         })
 
     def _cmd_get_config(self, msg):
@@ -558,10 +588,9 @@ class SerialHandler:
         interval_ms = msg.get("interval_ms", 50)
         if not isinstance(interval_ms, (int, float)):
             interval_ms = 50
-        interval_ms = max(interval_ms, _STREAM_MIN_MS)
         self._streaming = True
-        self._stream_interval = interval_ms / 1000.0
-        self._stream_last = 0.0
+        self._stream_interval_ms = int(max(interval_ms, _STREAM_MIN_MS))
+        self._stream_last = 0
         self._stream_prev_btns = None
         self._stream_prev_axes = None
         self._stream_prev_pins = None
@@ -768,7 +797,7 @@ class SerialHandler:
         self._chunk_expect = size
         self._chunk_seq = 0
         self._chunk_meta = meta
-        self._chunk_deadline = time.monotonic() + _CHUNK_TIMEOUT
+        self._chunk_deadline = supervisor.ticks_ms() + _CHUNK_TIMEOUT_MS
         self._chunk_op = op
         self._send({"ok": True, "ready": True})
 
@@ -804,8 +833,8 @@ class SerialHandler:
                 return
 
             self._chunk_seq += 1
-            self._chunk_deadline = time.monotonic() + _CHUNK_TIMEOUT
-            self._send({"ok": True})
+            self._chunk_deadline = supervisor.ticks_ms() + _CHUNK_TIMEOUT_MS
+            self._send({"ok": True, "seq": seq})
 
         elif msg.get("done"):
             self._finish_chunk()
