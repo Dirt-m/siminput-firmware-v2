@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="2.5.0"
+VERSION="2.6.0"
 OUT="siminput-firmware-${VERSION}.zip"
 
 # The version the firmware reports must match the version this package

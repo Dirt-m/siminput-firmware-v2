@@ -1,6 +1,7 @@
 import board
 import busio
 import digitalio
+import gc
 import pwmio
 import rotaryio
 import time
@@ -31,6 +32,20 @@ def _gpio_pin(n):
     except AttributeError:
         return getattr(microcontroller.pin, f'GPIO{n}')
 
+
+# All loop timing runs on supervisor.ticks_ms (integer milliseconds, wraps at
+# 2**29 ≈ 6.2 days). time.monotonic is unusable here: CircuitPython floats are
+# single precision, so after ~9 hours of uptime its resolution is coarser than
+# the 5 ms cycle (the loop free-runs) and after days of uptime coarser than a
+# button press (debounce silently swallows short presses).
+_TICKS_PERIOD = 1 << 29
+_TICKS_HALF = 1 << 28
+
+
+def ticks_diff(a, b):
+    """Signed a-b for two ticks_ms values, wrap-safe for spans < 2**28 ms."""
+    return ((a - b + _TICKS_HALF) % _TICKS_PERIOD) - _TICKS_HALF
+
 # Report layout (32 bytes):
 #   Bytes  0-15 : 128 buttons, 1 bit each.
 #                 Bit N = button N (0-indexed).  B0=bit0, B1=bit1 … B127=bit127.
@@ -41,16 +56,33 @@ def _gpio_pin(n):
 REPORT_SIZE = 32
 B_MAX       = 127
 
-NVM_MAGIC = 0xA5
-# NVM layout: [magic][num_bools][num_axes][bool bytes…][axis lo/hi pairs…]
-NVM_HDR   = 3
+NVM_MAGIC = 0xA6
+# NVM layout: [magic][num_bools][num_axes][id_hash][bool bytes…][axis lo/hi pairs…]
+# The id_hash byte covers the ordered id list, so renaming or reordering
+# stored items invalidates old data instead of restoring values into the
+# wrong slots. (Magic bumped from 0xA5: the old 3-byte header had no id_hash,
+# so stored values reset once on upgrade.)
+NVM_HDR   = 4
 
-# Quadrature encoder Gray-code transition table (software fallback for expander pins).
-# Key: (prev_a, prev_b, curr_a, curr_b) → +1 CW / -1 CCW / absent = invalid/noise
-_ENC_TABLE = {
-    (0, 0, 1, 0):  1,  (1, 0, 1, 1):  1,  (1, 1, 0, 1):  1,  (0, 1, 0, 0):  1,
-    (0, 0, 0, 1): -1,  (0, 1, 1, 1): -1,  (1, 1, 1, 0): -1,  (1, 0, 0, 0): -1,
-}
+# Quadrature encoder Gray-code transition table (software fallback for
+# expander pins), indexed by the packed int (prev_a<<3)|(prev_b<<2)|(curr_a<<1)|curr_b.
+# 0 = invalid/noise. A tuple, not a dict: indexing it allocates nothing, and
+# the tight poll loop runs thousands of times per second.
+_ENC_TABLE = (
+    0, -1, 1, 0,   # 00 -> 00,01,10,11
+    1, 0, 0, -1,   # 01 -> ...
+    -1, 0, 0, 1,   # 10 -> ...
+    0, 1, -1, 0,   # 11 -> ...
+)
+
+
+def _id_list_hash(ids):
+    h = 0
+    for s in ids:
+        for ch in s:
+            h = (h * 31 + ord(ch)) & 0xFF
+        h = (h * 31 + 0x2C) & 0xFF  # separator, so ("ab","c") != ("a","bc")
+    return h
 
 # ---------------------------------------------------------------------------
 # Board revision detection
@@ -101,7 +133,7 @@ class NVMStorage:
     Items are silently truncated if the config requests more storage than NVM can hold.
     """
 
-    _FLUSH_INTERVAL = 5.0  # seconds between NVM flushes
+    _FLUSH_INTERVAL_MS = 5000  # between NVM flushes
 
     def __init__(self, stored_bools, stored_axes):
         self._bool_offsets = {}
@@ -109,7 +141,9 @@ class NVMStorage:
         self._bool_cache   = {}
         self._axis_cache   = {}
         self._dirty        = False
-        self._last_flush   = 0.0
+        self._last_flush   = 0
+        self._size         = 0
+        self._id_hash      = 0
 
         if not stored_bools and not stored_axes:
             return  # nothing to persist — leave NVM completely untouched
@@ -133,10 +167,14 @@ class NVMStorage:
         for aid, _ in stored_axes:
             self._axis_offsets[aid] = offset
             offset += 2
+        self._size = offset
+        self._id_hash = _id_list_hash(
+            [bid for bid, _ in stored_bools] + [aid for aid, _ in stored_axes])
 
         valid = (nvm[0] == NVM_MAGIC
                  and nvm[1] == len(stored_bools)
-                 and nvm[2] == len(stored_axes))
+                 and nvm[2] == len(stored_axes)
+                 and nvm[3] == self._id_hash)
 
         if valid:
             for bid, _ in stored_bools:
@@ -145,17 +183,12 @@ class NVMStorage:
                 off = self._axis_offsets[aid]
                 self._axis_cache[aid] = nvm[off] | (nvm[off + 1] << 8)
         else:
-            nvm[0] = NVM_MAGIC
-            nvm[1] = len(stored_bools)
-            nvm[2] = len(stored_axes)
             for bid, default in stored_bools:
                 self._bool_cache[bid] = default
-                nvm[self._bool_offsets[bid]] = 1 if default else 0
             for aid, default in stored_axes:
                 self._axis_cache[aid] = default
-                off = self._axis_offsets[aid]
-                nvm[off]     = default & 0xFF
-                nvm[off + 1] = (default >> 8) & 0xFF
+            self._dirty = True
+            self.flush(force=True)
 
     def read_bool(self, bid):
         return self._bool_cache.get(bid, False)
@@ -179,19 +212,30 @@ class NVMStorage:
 
         Called from the main loop every cycle (no-op when clean or too soon) and
         with force=True before any microcontroller reset.
+
+        The whole image is written as one slice assignment: on RP2040 every
+        nvm byte store that changes a bit erases and reprograms a full 4 KB
+        sector with interrupts disabled (~tens of ms), so per-byte writes cost
+        one sector erase per byte and stall USB for hundreds of ms per flush.
+        One slice = one erase, regardless of item count.
         """
-        if not self._dirty:
+        if not self._dirty or self._size == 0:
             return
-        now = time.monotonic()
-        if not force and now - self._last_flush < self._FLUSH_INTERVAL:
+        now = supervisor.ticks_ms()
+        if not force and ticks_diff(now, self._last_flush) < self._FLUSH_INTERVAL_MS:
             return
-        nvm = microcontroller.nvm
+        buf = bytearray(self._size)
+        buf[0] = NVM_MAGIC
+        buf[1] = len(self._bool_offsets)
+        buf[2] = len(self._axis_offsets)
+        buf[3] = self._id_hash
         for bid, off in self._bool_offsets.items():
-            nvm[off] = 1 if self._bool_cache.get(bid, False) else 0
+            buf[off] = 1 if self._bool_cache.get(bid, False) else 0
         for aid, off in self._axis_offsets.items():
             val = self._axis_cache.get(aid, 0)
-            nvm[off]     = val & 0xFF
-            nvm[off + 1] = (val >> 8) & 0xFF
+            buf[off]     = val & 0xFF
+            buf[off + 1] = (val >> 8) & 0xFF
+        microcontroller.nvm[0:self._size] = buf
         self._dirty      = False
         self._last_flush = now
 
@@ -203,6 +247,7 @@ class ButtonBox:
 
     def __init__(self):
         self.config = self._load_config()
+        self.fault = ""
         self.board_map = self._detect_board()
         self.pin_map = self.board_map.get("pins", {})
         self.pin_names = frozenset(self.pin_map.keys())
@@ -216,17 +261,23 @@ class ButtonBox:
             self._parse_config()
 
         self.report            = bytearray(REPORT_SIZE)
+        self._report_scratch   = bytearray(REPORT_SIZE)
         self.gamepad           = None
         self._needs_refresh    = False
         self._last_backlight   = -1       # force first PWM write
-        self._last_report_time = 0.0
+        self._last_report_time = 0
+        self._gc_countdown     = 200
         self._acquire_hid()
+        # Boot sequence: read the hardware, compute the steady state with all
+        # side effects suppressed, and only then seed the edge detectors — so
+        # a rule chained off another rule's output (NOR → TOGGLE) does not see
+        # a phantom rising edge and flip stored state at every power-on.
         self._read_all_pins()
         self._init_encoder_states()
-        self._init_rule_states()          # seed prev_input → no spurious edges on first cycle
-        self._process_rules()             # apply MAP/NOR/etc. so the initial report is accurate
         self._apply_default_passthrough()
-        self.report = self._build_report()
+        self._seed_rule_states()
+        self._process_rules()             # real pass — edge detectors are seeded, nothing fires
+        self._build_report(self.report)
         self._send_report()
 
         # USB reconnect guard — see _check_usb_reconnect().
@@ -267,14 +318,23 @@ class ButtonBox:
                     i2c.deinit()
                 except Exception:
                     pass
-        raise RuntimeError("No TCA9555 found on any known I2C bus")
+        # A dead expander (bad joint, shorted bus) must not kill the whole
+        # box: continue with the direct-GPIO inputs and report the fault over
+        # serial so the desktop app can show it. Expander pins read as off.
+        print("WARNING: no TCA9555 found — continuing without expander inputs")
+        self.i2c = None
+        self.fault = "no_expander"
+        return _board_map(_I2C_BUSES[0][0])
 
     def _init_hardware(self):
-        self.expander = TCA9555(self.i2c)
-        self.expander.configuration_port_0      = 0xFF
-        self.expander.configuration_port_1      = 0xFF
-        self.expander.polarity_inversion_port_0 = 0xFF
-        self.expander.polarity_inversion_port_1 = 0xFF
+        if self.i2c is not None:
+            self.expander = TCA9555(self.i2c)
+            self.expander.configuration_port_0      = 0xFF
+            self.expander.configuration_port_1      = 0xFF
+            self.expander.polarity_inversion_port_0 = 0xFF
+            self.expander.polarity_inversion_port_1 = 0xFF
+        else:
+            self.expander = None
 
         self.gpio_pins = {}
         for name, data in self.pin_map.items():
@@ -301,13 +361,13 @@ class ButtonBox:
         # any app that connects after boot sees the current state within N seconds.
         # Set "inactivity_refresh": false to disable.
         _ir = dev.get("inactivity_refresh", 1.0)
-        self._inactivity_refresh = None if (_ir is False or _ir is None) else float(_ir)
+        self._inactivity_ms = None if (_ir is False or _ir is None) else int(float(_ir) * 1000)
 
         # Debounce: a D-pin state change is only committed to pin_cache once the new
         # level has been stable for this many milliseconds.  The 200Hz sample rate
         # already provides 5ms of implicit filtering, so that is the minimum effective
         # value.  10-20ms is good for clicky switches; 50ms matches the old firmware.
-        self._debounce_s = max(dev.get("debounce_ms", 10), 0) / 1000.0
+        self._debounce_ms = int(max(dev.get("debounce_ms", 10), 0))
 
         # Cache the active rules list up-front (comment-only entries stripped).
         self.rules = [r for r in cfg.get("rules", []) if r.get("type")]
@@ -367,21 +427,28 @@ class ButtonBox:
         self.b_states             = {}
         self.claimed_b            = set()
         self._pin_raw             = {}    # last raw reading per D-pin
-        self._pin_change_time     = {}    # time the raw reading last differed from stable
+        self._pin_change_time     = {}    # ticks_ms the raw reading last differed from stable
         # Single-cycle encoder outputs (pulse_ms=0) are zeroed at the start of every
         # cycle. Downstream AXIS rules that feed from them also get their prev_input
         # reset, which lets back-to-back ticks each trigger exactly one rising edge.
         self.encoder_b_outputs    = set()    # B-number ints
         self.encoder_bool_outputs = set()    # BOOL id strings
         self.rule_prev_input      = {}
-        # Hardware encoder state: rule_idx → (rotaryio.IncrementalEncoder, pulse_s)
-        # Software encoder state: rule_idx → (prev_a, prev_b, pulse_s)
+        # Hardware encoder state: rule_idx → (rotaryio.IncrementalEncoder, pulse_ms)
         self.hw_encoders          = {}
         self.hw_encoder_positions = {}       # rule_idx → last known position
-        self.sw_encoder_states    = {}       # rule_idx → (prev_a, prev_b, pulse_s, accum)
-        self.sw_encoder_cfg       = {}       # rule_idx → (name_a, name_b, divisor, invert) — cached for tight polling
+        # Software encoder state: rule_idx → [prev_a, prev_b, accum] (a mutable
+        # list, updated in place — the tight poll loop must not allocate)
+        self.sw_encoder_states    = {}
+        self.sw_encoder_cfg       = {}       # rule_idx → (name_a, name_b, divisor, invert, pulse_ms)
         self._sw_enc_pending      = {}       # rule_idx → signed int; accumulated steps between _process_rules drains
-        self.pending_delays       = []
+        # Multi-detent encoder presses: ref → queued press count / cooldown, so
+        # a fast spin emits N discrete presses over following cycles instead of
+        # collapsing into one.
+        self._enc_out_queue       = {}
+        self._enc_out_cooldown    = {}
+        self._enc_out_pulse       = {}       # ref → pulse_ms
+        self.pending_delays       = []       # (apply_ticks_ms, ref, value)
         self.pin_cache            = {}
         self._enc_axis_rules      = set()    # AXIS rules fed by single-cycle encoder outputs
         # encoder_axis_links: rule_idx (ENCODER) → [(trigger_dir, axis_id, step, is_inc)]
@@ -399,13 +466,13 @@ class ButtonBox:
         for enc_idx, rule in enumerate(self.rules):
             if rule.get("type") != "ENCODER":
                 continue
-            pulse_s = rule.get("pulse_ms", 0) / 1000.0
+            pulse_ms = int(rule.get("pulse_ms", 0))
             for key, trig_dir in (("cw", 1), ("ccw", -1)):
                 ref = rule.get(key, "")
                 if not ref:
                     continue
                 encoder_output_to_enc[ref] = (enc_idx, trig_dir)
-                if pulse_s == 0:
+                if pulse_ms == 0:
                     if ref.startswith("B") and ref[1:].isdigit():
                         self.encoder_b_outputs.add(int(ref[1:]))
                     elif ref in self.bool_states:
@@ -425,8 +492,8 @@ class ButtonBox:
         for enc_idx, rule in enumerate(self.rules):
             if rule.get("type") != "ENCODER":
                 continue
-            inputs  = rule.get("inputs", [])
-            pulse_s = rule.get("pulse_ms", 0) / 1000.0
+            inputs   = rule.get("inputs", [])
+            pulse_ms = int(rule.get("pulse_ms", 0))
 
             both_gpio = (len(inputs) == 2
                          and self.pin_map.get(inputs[0], {}).get("type") == "gpio"
@@ -445,24 +512,29 @@ class ButtonBox:
                     pin_b   = _gpio_pin(self.pin_map[inputs[1]]["pin"])
                     divisor = rule.get("divisor", 2)
                     enc     = rotaryio.IncrementalEncoder(pin_a, pin_b, divisor=divisor)
-                    self.hw_encoders[enc_idx]          = (enc, pulse_s)
+                    self.hw_encoders[enc_idx]          = (enc, pulse_ms)
                     self.hw_encoder_positions[enc_idx] = enc.position
                 except Exception as e:
                     print("rotaryio encoder init failed:", e)
                     # Pins were deinit'd above — re-claim them as DigitalInOut
                     # so the software encoder path can actually read them.
+                    # Guarded per pin: a re-claim failure (pin left half-owned
+                    # by rotaryio) must not escape and wipe the whole config.
                     for inp in inputs:
                         if inp not in self.gpio_pins:
-                            pin_obj       = _gpio_pin(self.pin_map[inp]["pin"])
-                            pin           = digitalio.DigitalInOut(pin_obj)
-                            pin.direction = digitalio.Direction.INPUT
-                            pin.pull      = digitalio.Pull.UP
-                            self.gpio_pins[inp] = pin
-                    self.sw_encoder_states[enc_idx] = (0, 0, pulse_s, 0)
+                            try:
+                                pin_obj       = _gpio_pin(self.pin_map[inp]["pin"])
+                                pin           = digitalio.DigitalInOut(pin_obj)
+                                pin.direction = digitalio.Direction.INPUT
+                                pin.pull      = digitalio.Pull.UP
+                                self.gpio_pins[inp] = pin
+                            except Exception as e2:
+                                print("encoder pin re-claim failed:", inp, e2)
+                    self.sw_encoder_states[enc_idx] = [0, 0, 0]
             else:
                 if both_gpio and not sequential:
                     print("ENCODER", inputs, "GPIOs not sequential — using software path")
-                self.sw_encoder_states[enc_idx] = (0, 0, pulse_s, 0)
+                self.sw_encoder_states[enc_idx] = [0, 0, 0]
 
         # Pass 2 — claimed_b, per-rule state, enc_axis_rules, encoder_axis_links.
         for i, rule in enumerate(self.rules):
@@ -499,6 +571,11 @@ class ButtonBox:
 
         # Cache per-rule inputs/divisor/invert for software encoders so the
         # tight-poll inner loop doesn't repeat dict lookups on every sample.
+        # Also note which expander ports the encoders actually need, so the
+        # tight loop reads each port once per tick (one I2C transaction)
+        # instead of once per pin — two separate reads tear the quadrature
+        # sample at speed and silently drop detents.
+        self._enc_ports_needed = [False, False]
         for enc_idx in self.sw_encoder_states:
             r      = self.rules[enc_idx]
             inputs = r.get("inputs", [])
@@ -507,7 +584,12 @@ class ButtonBox:
                 inputs[1] if len(inputs) >= 2 else "",
                 r.get("divisor", 2),
                 r.get("invert", False),
+                int(r.get("pulse_ms", 0)),
             )
+            for name in inputs:
+                data = self.pin_map.get(name)
+                if data and data["type"] == "expander":
+                    self._enc_ports_needed[0 if data["pin"] < 8 else 1] = True
 
     def _acquire_hid(self):
         try:
@@ -523,21 +605,44 @@ class ButtonBox:
             if rule.get("type") == "ENCODER" and i in self.sw_encoder_states:
                 inputs = rule.get("inputs", [])
                 if len(inputs) >= 2:
-                    a_v = int(self._read_encoder_pin(inputs[0]))
-                    b_v = int(self._read_encoder_pin(inputs[1]))
-                    _, _, pulse_s, accum = self.sw_encoder_states.get(i, (0, 0, 0, 0))
-                    self.sw_encoder_states[i] = (a_v, b_v, pulse_s, accum)
+                    state = self.sw_encoder_states[i]
+                    state[0] = int(self._read_encoder_pin(inputs[0]))
+                    state[1] = int(self._read_encoder_pin(inputs[1]))
 
-    def _init_rule_states(self):
-        """Seed rule_prev_input from actual pin states before the first process pass.
+    def _seed_rule_states(self):
+        """Settle MAP/NOR outputs without side effects, then seed every edge
+        detector from the resulting state.
 
-        Without this, any input already active at power-on would look like a rising
-        edge on the very first cycle — triggering TOGGLEs, queuing DELAYs, and
-        stepping axes even though nothing actually changed.
+        Seeding only from live pins is not enough: a rule chained off another
+        rule's output (e.g. NOR D3,D4 → B30 feeding TOGGLE B30) would see that
+        B30 as False during seeding and get a phantom rising edge on cycle 0 —
+        flipping stored toggles at every power-on. Two settle passes cover
+        chains through one level of forward references.
         """
+        for _ in range(2):
+            for rule in self.rules:
+                rtype = rule.get("type", "")
+                if rtype == "MAP":
+                    val = self._read_input(rule.get("input", ""))
+                    if rule.get("invert", False):
+                        val = not val
+                    self._write_output_seed(rule.get("output", ""), val)
+                elif rtype == "NOR":
+                    result = not any(self._read_input(inp) for inp in rule.get("inputs", []))
+                    if rule.get("invert", False):
+                        result = not result
+                    self._write_output_seed(rule.get("output", ""), result)
         for i, rule in enumerate(self.rules):
             if rule.get("type") in ("TOGGLE", "PULSE", "AXIS_INC", "AXIS_DEC"):
                 self.rule_prev_input[i] = self._read_input(rule.get("input", ""))
+
+    def _write_output_seed(self, ref, value):
+        """Like _write_output, but never touches NVM or the refresh flag —
+        used only by the boot seeding pass."""
+        if ref.startswith("B") and ref[1:].isdigit():
+            self.b_states[int(ref[1:])] = value
+        elif ref in self.bool_states:
+            self.bool_states[ref] = value
 
     # ------------------------------------------------------------------
     # Pin reading
@@ -550,7 +655,7 @@ class ButtonBox:
         except Exception:
             port0, port1 = 0, 0
 
-        now = time.monotonic()
+        now = supervisor.ticks_ms()
         for name, data in self.pin_map.items():
             if data['type'] == 'gpio':
                 pin = self.gpio_pins.get(name)
@@ -570,7 +675,7 @@ class ButtonBox:
                 # Level changed — restart the debounce timer, don't commit yet.
                 self._pin_raw[name]         = raw
                 self._pin_change_time[name] = now
-            elif now - self._pin_change_time[name] >= self._debounce_s:
+            elif ticks_diff(now, self._pin_change_time[name]) >= self._debounce_ms:
                 # Stable long enough — commit.
                 self.pin_cache[name] = raw
 
@@ -585,13 +690,18 @@ class ButtonBox:
             return self.b_states.get(int(ref[1:]), False)
         return self.bool_states.get(ref, False)
 
-    def _read_encoder_pin(self, name):
+    def _read_encoder_pin(self, name, ports=None):
         """Read a pin live, bypassing pin_cache's debounce.
 
         Debouncing would drop legitimate encoder edges that arrive inside the
         debounce window; rotaryio doesn't debounce on the hardware path either.
-        Bounce is handled implicitly by the Gray-code table (invalid 4-tuples
-        map to direction=0).
+        Bounce is handled implicitly by the Gray-code table (invalid
+        transitions decode to direction=0).
+
+        `ports` is an optional (port0, port1) snapshot: the tight poll loop
+        reads each expander port once per tick and decodes every encoder from
+        the same instant, so a fast rotation can't tear the A/B sample between
+        two I2C transactions.
         """
         data = self.pin_map.get(name)
         if data is None:
@@ -600,10 +710,15 @@ class ButtonBox:
             pin = self.gpio_pins.get(name)
             return (not pin.value) if pin else False
         pnum = data['pin']
-        try:
-            port = self.expander.input_port_0 if pnum < 8 else self.expander.input_port_1
-        except Exception:
-            return False
+        if ports is not None:
+            port = ports[0] if pnum < 8 else ports[1]
+            if port is None:
+                return False
+        else:
+            try:
+                port = self.expander.input_port_0 if pnum < 8 else self.expander.input_port_1
+            except Exception:
+                return False
         bit = pnum if pnum < 8 else pnum - 8
         return bool(port & (1 << bit))
 
@@ -618,14 +733,32 @@ class ButtonBox:
         is captured. Hardware (rotaryio) encoders are interrupt-driven and
         never need this.
         """
-        for i, (name_a, name_b, divisor, invert) in self.sw_encoder_cfg.items():
-            prev_a, prev_b, pulse_s, accum = self.sw_encoder_states[i]
-            curr_a = int(self._read_encoder_pin(name_a))
-            curr_b = int(self._read_encoder_pin(name_b))
-            raw_dir = _ENC_TABLE.get((prev_a, prev_b, curr_a, curr_b), 0)
+        # One I2C read per needed port per tick; on a read error skip the
+        # whole tick rather than fabricating a 0 level (which would itself be
+        # a spurious transition).
+        port0 = port1 = None
+        if self.expander is not None:
+            try:
+                if self._enc_ports_needed[0]:
+                    port0 = self.expander.input_port_0
+                if self._enc_ports_needed[1]:
+                    port1 = self.expander.input_port_1
+            except Exception:
+                return
+        elif self._enc_ports_needed[0] or self._enc_ports_needed[1]:
+            port0 = port1 = 0  # no expander (degraded mode): pins read as off
+        ports = (port0, port1)
+
+        for i, (name_a, name_b, divisor, invert, _pulse) in self.sw_encoder_cfg.items():
+            state = self.sw_encoder_states[i]
+            prev_a = state[0]
+            prev_b = state[1]
+            curr_a = 1 if self._read_encoder_pin(name_a, ports) else 0
+            curr_b = 1 if self._read_encoder_pin(name_b, ports) else 0
+            raw_dir = _ENC_TABLE[(prev_a << 3) | (prev_b << 2) | (curr_a << 1) | curr_b]
             if invert:
                 raw_dir = -raw_dir
-            accum += raw_dir
+            accum = state[2] + raw_dir
             pending = self._sw_enc_pending.get(i, 0)
             while accum >= divisor:
                 accum   -= divisor
@@ -633,9 +766,13 @@ class ButtonBox:
             while accum <= -divisor:
                 accum   += divisor
                 pending -= 1
-            if pending:
-                self._sw_enc_pending[i] = pending
-            self.sw_encoder_states[i] = (curr_a, curr_b, pulse_s, accum)
+            # Written back unconditionally: a +1 cancelled by a -1 within one
+            # drain window must clear the stored value, or the stale entry
+            # fires a phantom tick later.
+            self._sw_enc_pending[i] = pending
+            state[0] = curr_a
+            state[1] = curr_b
+            state[2] = accum
 
     def _write_output(self, ref, value):
         if ref.startswith("B") and ref[1:].isdigit():
@@ -652,12 +789,49 @@ class ButtonBox:
     # Rule engine
     # ------------------------------------------------------------------
 
-    def _apply_encoder_output(self, ref, pulse_s, now):
-        """Fire an encoder output (B or BOOL) and schedule its clear if pulse_ms > 0."""
-        self._write_output(ref, True)
-        if pulse_s > 0:
-            self.pending_delays = [(t, o, v) for t, o, v in self.pending_delays if o != ref]
-            self.pending_delays.append((now + pulse_s, ref, False))
+    def _enqueue_encoder_output(self, ref, pulse_ms, steps):
+        """Queue `steps` discrete presses of an encoder output.
+
+        A fast spin can accumulate several detents in one 5 ms cycle; firing
+        them as one press under-counts in games bound to "next gear"-style
+        actions, and with pulse_ms > 0 it used to collapse into one long hold.
+        The queue is bounded so a flywheel spin can't bank seconds of phantom
+        presses.
+        """
+        self._enc_out_pulse[ref] = pulse_ms
+        self._enc_out_queue[ref] = min(self._enc_out_queue.get(ref, 0) + steps, 16)
+
+    def _service_encoder_queue(self, now):
+        """Emit at most one queued encoder press per output per eligible cycle,
+        with an off-gap between presses so the HID host sees distinct edges."""
+        if not self._enc_out_queue:
+            return
+        done = None
+        for ref, pending in self._enc_out_queue.items():
+            cd = self._enc_out_cooldown.get(ref, 0)
+            if cd > 0:
+                self._enc_out_cooldown[ref] = cd - 1
+                continue
+            pulse_ms = self._enc_out_pulse.get(ref, 0)
+            self._write_output(ref, True)
+            if pulse_ms > 0:
+                self.pending_delays = [(t, o, v) for t, o, v in self.pending_delays if o != ref]
+                self.pending_delays.append((now + pulse_ms, ref, False))
+                # Busy for the pulse duration plus one off cycle.
+                self._enc_out_cooldown[ref] = pulse_ms // 5 + 2
+            else:
+                # Single-cycle output: high this cycle (zeroed again at the
+                # next cycle start), then one low cycle before the next press.
+                self._enc_out_cooldown[ref] = 2
+            if pending <= 1:
+                if done is None:
+                    done = []
+                done.append(ref)
+            else:
+                self._enc_out_queue[ref] = pending - 1
+        if done:
+            for ref in done:
+                del self._enc_out_queue[ref]
 
     def _apply_encoder_axes(self, enc_idx, direction, steps):
         """Apply a multi-step encoder delta directly to all linked axes."""
@@ -673,7 +847,7 @@ class ButtonBox:
                 self.nvm.write_axis(axis_id, self.axis_states[axis_id])
 
     def _process_rules(self):
-        now = time.monotonic()
+        now = supervisor.ticks_ms()
 
         # Zero single-cycle encoder outputs so each tick is a fresh rising edge.
         # Direct assignment skips _write_output to avoid NVM writes every cycle.
@@ -684,11 +858,14 @@ class ButtonBox:
         for i in self._enc_axis_rules:
             self.rule_prev_input[i] = False
 
+        # Emit queued multi-detent encoder presses.
+        self._service_encoder_queue(now)
+
         # Apply expired delays.
         if self.pending_delays:
             remaining = []
             for apply_time, out_ref, value in self.pending_delays:
-                if now >= apply_time:
+                if ticks_diff(now, apply_time) >= 0:
                     self._write_output(out_ref, value)
                 else:
                     remaining.append((apply_time, out_ref, value))
@@ -727,20 +904,20 @@ class ButtonBox:
                 prev = self.rule_prev_input[i]
                 triggered = (not curr and prev) if invert else (curr and not prev)
                 if triggered:
-                    delay_s = rule.get("delay_ms", 0) / 1000.0
-                    pulse_s = rule.get("pulse_ms", 100) / 1000.0
+                    delay_ms = int(rule.get("delay_ms", 0))
+                    pulse_ms = int(rule.get("pulse_ms", 100))
                     self.pending_delays = [(t, o, v) for t, o, v in self.pending_delays
                                            if o != out]
-                    if delay_s > 0 and self._read_input(out):
+                    if delay_ms > 0 and self._read_input(out):
                         # Output is still high from a previous pulse — snap it off
                         # immediately so the retrigger feels responsive.
                         self._write_output(out, False)
-                    if delay_s == 0:
+                    if delay_ms == 0:
                         self._write_output(out, True)
-                        self.pending_delays.append((now + pulse_s, out, False))
+                        self.pending_delays.append((now + pulse_ms, out, False))
                     else:
-                        self.pending_delays.append((now + delay_s, out, True))
-                        self.pending_delays.append((now + delay_s + pulse_s, out, False))
+                        self.pending_delays.append((now + delay_ms, out, True))
+                        self.pending_delays.append((now + delay_ms + pulse_ms, out, False))
                 self.rule_prev_input[i] = curr
 
             elif rtype == "ENCODER":
@@ -750,7 +927,7 @@ class ButtonBox:
 
                 if i in self.hw_encoders:
                     # Hardware path — rotaryio interrupt-driven, never misses a step.
-                    enc, pulse_s = self.hw_encoders[i]
+                    enc, pulse_ms = self.hw_encoders[i]
                     pos   = enc.position
                     delta = pos - self.hw_encoder_positions[i]
                     self.hw_encoder_positions[i] = pos
@@ -763,14 +940,16 @@ class ButtonBox:
                     # poll loop (_tick_sw_encoders). All live pin reads and
                     # Gray-code decoding happen there, at sub-millisecond rate.
                     pending   = self._sw_enc_pending.pop(i, 0)
-                    _, _, pulse_s, _ = self.sw_encoder_states[i]
+                    pulse_ms  = self.sw_encoder_cfg[i][4] if i in self.sw_encoder_cfg else 0
                     direction = 1 if pending > 0 else (-1 if pending < 0 else 0)
                     steps     = abs(pending)
 
                 if direction:
                     ref = rule.get("cw" if direction == 1 else "ccw", "")
                     if ref:
-                        self._apply_encoder_output(ref, pulse_s, now)
+                        # Queued as discrete presses (serviced at the top of
+                        # every cycle) so multi-detent spins press N times.
+                        self._enqueue_encoder_output(ref, pulse_ms, steps)
                     # Apply multi-step delta directly to linked axes so fast
                     # spinning never loses steps (each step is always counted).
                     self._apply_encoder_axes(i, direction, steps)
@@ -809,24 +988,25 @@ class ButtonBox:
     # Report building
     # ------------------------------------------------------------------
 
-    def _build_report(self):
-        report = bytearray(REPORT_SIZE)
-
+    def _build_report(self, report):
+        """Fill `report` in place (a reused scratch buffer — building a fresh
+        bytearray plus a dict every 5 ms cycle was steady GC pressure)."""
+        for i in range(16):
+            report[i] = 0
         for bnum, state in self.b_states.items():
             if state and 0 <= bnum <= B_MAX:
                 report[bnum >> 3] |= 1 << (bnum & 7)
 
-        slot_values = {}
+        for slot in range(1, 9):
+            off = 16 + (slot - 1) * 2
+            report[off]     = 0xFF
+            report[off + 1] = 0x7F
         for aid, val in self.axis_states.items():
             slot = self.axis_output_slot.get(aid)
             if slot is not None:
-                slot_values[slot] = val
-        for slot in range(1, 9):
-            val = slot_values.get(slot, 32767)
-            off = 16 + (slot - 1) * 2
-            report[off]     = val & 0xFF
-            report[off + 1] = (val >> 8) & 0xFF
-
+                off = 16 + (slot - 1) * 2
+                report[off]     = val & 0xFF
+                report[off + 1] = (val >> 8) & 0xFF
         return report
 
     # ------------------------------------------------------------------
@@ -893,30 +1073,35 @@ class ButtonBox:
     # Main update
     # ------------------------------------------------------------------
 
-    _CYCLE_S = 0.005   # 200 Hz main-loop cadence
+    _CYCLE_MS = 5   # 200 Hz main-loop cadence
 
     def update(self):
-        cycle_start = time.monotonic()
+        cycle_start = supervisor.ticks_ms()
         self._check_usb_reconnect()
         self.serial.process()
         self._read_all_pins()
         # Catch anything that happened during the previous cycle's tight poll.
         if self.sw_encoder_cfg:
             self._tick_sw_encoders()
+        # Passthrough before rules: a rule reading an unclaimed button (B5 for
+        # D5) must see this cycle's value, matching the documented same-cycle
+        # semantics. claimed_b keeps passthrough off every rule-driven output.
+        self._apply_default_passthrough()
         self._process_rules()
         if self.nvm is not None:
             self.nvm.flush()
-        self._apply_default_passthrough()
         self._apply_backlight()
 
-        now = time.monotonic()
-        if (self._inactivity_refresh is not None
-                and now - self._last_report_time >= self._inactivity_refresh):
+        now = supervisor.ticks_ms()
+        if (self._inactivity_ms is not None
+                and ticks_diff(now, self._last_report_time) >= self._inactivity_ms):
             self._needs_refresh = True
 
-        new_report = self._build_report()
+        new_report = self._build_report(self._report_scratch)
         if new_report != self.report or self._needs_refresh:
-            self.report            = new_report
+            # Swap the buffers: `report` keeps the last-sent image for the
+            # change compare, `scratch` is rebuilt next cycle.
+            self.report, self._report_scratch = new_report, self.report
             self._needs_refresh    = False
             self._last_report_time = now
             self._send_report()
@@ -927,18 +1112,24 @@ class ButtonBox:
 
         self.serial.maybe_send_stream()
 
+        # Collect on a fixed cadence (about once a second) instead of letting
+        # allocation pressure trigger GC at a random point mid-cycle.
+        self._gc_countdown -= 1
+        if self._gc_countdown <= 0:
+            self._gc_countdown = 200
+            gc.collect()
+
         # Wait out the rest of the 5 ms cycle. If there are software-path
         # encoders, spend that time tight-polling them at ~sub-millisecond rate
         # so fast rotations don't slip between 200 Hz samples and get decoded
         # as invalid Gray transitions. Otherwise just sleep.
-        deadline = cycle_start + self._CYCLE_S
         if self.sw_encoder_cfg:
-            while time.monotonic() < deadline:
+            while ticks_diff(supervisor.ticks_ms(), cycle_start) < self._CYCLE_MS:
                 self._tick_sw_encoders()
         else:
-            remaining = deadline - time.monotonic()
+            remaining = self._CYCLE_MS - ticks_diff(supervisor.ticks_ms(), cycle_start)
             if remaining > 0:
-                time.sleep(remaining)
+                time.sleep(remaining / 1000.0)
 
 
 # ---------------------------------------------------------------------------
