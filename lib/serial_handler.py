@@ -7,7 +7,7 @@ import sys
 import microcontroller
 import supervisor
 
-FW_VERSION = "2.4.1"
+FW_VERSION = "2.5.0"
 
 _MAX_LINE = 4096
 _CHUNK_SIZE = 2048
@@ -61,6 +61,8 @@ def validate_config(cfg, pin_names):
     bools = cfg.get("bools", [])
     if not isinstance(bools, list):
         return False, "bools must be a list"
+    if len(bools) > 255:
+        return False, "too many bools (max 255)"
 
     all_ids = set()
     for i, b in enumerate(bools):
@@ -82,6 +84,8 @@ def validate_config(cfg, pin_names):
     axes = cfg.get("axes", [])
     if not isinstance(axes, list):
         return False, "axes must be a list"
+    if len(axes) > 255:
+        return False, "too many axes (max 255)"
 
     used_slots = set()
     axis_ids = set()
@@ -123,6 +127,8 @@ def validate_config(cfg, pin_names):
     rules = cfg.get("rules", [])
     if not isinstance(rules, list):
         return False, "rules must be a list"
+    if len(rules) > 256:
+        return False, "too many rules (max 256)"
 
     def _valid_input(ref):
         if ref in pin_names:
@@ -140,6 +146,7 @@ def validate_config(cfg, pin_names):
             return True
         return ref in all_ids
 
+    encoder_pins = set()
     for i, r in enumerate(rules):
         if not isinstance(r, dict):
             return False, "rules[%d] must be an object" % i
@@ -190,6 +197,11 @@ def validate_config(cfg, pin_names):
             for inp in inputs:
                 if inp not in pin_names:
                     return False, "rules[%d] ENCODER: '%s' is not a valid pin name" % (i, inp)
+                if inp in encoder_pins:
+                    return False, "rules[%d] ENCODER: pin '%s' is already used by another encoder" % (i, inp)
+                encoder_pins.add(inp)
+            if inputs[0] == inputs[1]:
+                return False, "rules[%d] ENCODER: inputs must be two different pins" % i
             for key in ("cw", "ccw"):
                 ref = r.get(key, "")
                 if ref and not _valid_output(ref):
@@ -253,6 +265,30 @@ class SerialHandler:
 
         if self._data is not None:
             self._buf = bytearray(_MAX_LINE)
+            try:
+                # Bounded writes: without this, a host that stops reading fills
+                # the CDC TX FIFO and _send blocks the 200 Hz loop forever.
+                self._data.write_timeout = 0.5
+            except Exception:
+                pass
+
+        # Hash support differs per CircuitPython build: 9.x on RP2040 ships
+        # sha1 only, sha256 arrives with 10.x. Detect once; transfers verify
+        # with the strongest algorithm both sides support and always enforce
+        # the byte count.
+        self._hash_algo = ""
+        try:
+            import hashlib
+            for _algo in ("sha256", "sha1"):
+                try:
+                    hashlib.new(_algo)
+                    self._hash_algo = _algo
+                    break
+                except Exception:
+                    pass
+        except ImportError:
+            pass
+        self._discarding = False
 
     # ------------------------------------------------------------------
     # Main entry points (called from ButtonBox.update)
@@ -276,25 +312,25 @@ class SerialHandler:
         if avail == 0:
             return
 
-        space = _MAX_LINE - self._buf_pos
-        if space <= 0:
-            self._buf_pos = 0
-            self._send({"ok": False, "error": "line too long (max 4096 bytes)"})
-            while self._data.in_waiting > 0:
-                chunk = self._data.read(min(self._data.in_waiting, 256))
-                if b"\n" in chunk:
-                    break
-            return
-
-        raw = self._data.read(min(avail, space))
+        raw = self._data.read(min(avail, _MAX_LINE))
         if not raw:
             return
 
         for b in raw:
+            if self._discarding:
+                # Skipping the tail of an over-long line. Bytes after its
+                # newline belong to the next command and must be kept.
+                if b == 0x0A:
+                    self._discarding = False
+                continue
             if b == 0x0A:
                 line = bytes(self._buf[:self._buf_pos])
                 self._buf_pos = 0
                 self._handle_line(line)
+            elif self._buf_pos >= _MAX_LINE:
+                self._buf_pos = 0
+                self._discarding = True
+                self._send({"ok": False, "error": "line too long (max %d bytes)" % _MAX_LINE})
             else:
                 self._buf[self._buf_pos] = b
                 self._buf_pos += 1
@@ -302,10 +338,15 @@ class SerialHandler:
     def maybe_send_stream(self):
         if not self._streaming or self._data is None:
             return
+        if self._chunk_op is not None:
+            return  # never interleave stream frames with a chunked transfer
 
         now = time.monotonic()
         if now - self._stream_last < self._stream_interval:
             return
+        # Re-arm before the change check, so an idle box pays the comparison
+        # at the stream interval instead of every 5 ms cycle.
+        self._stream_last = now
 
         box = self._box
         active_btns = sorted(bnum for bnum, state in box.b_states.items() if state)
@@ -332,13 +373,10 @@ class SerialHandler:
         msg = {"s": {"b": active_btns, "a": axes}}
         if pins_changed:
             msg["s"]["p"] = pins_changed
-        try:
-            self._send(msg)
-        except Exception:
+        if not self._send(msg):
             self._streaming = False
             return
 
-        self._stream_last = now
         self._stream_prev_btns = btns_tuple
         self._stream_prev_axes = axes_tuple
         if self._stream_prev_pins is None:
@@ -351,12 +389,17 @@ class SerialHandler:
     # ------------------------------------------------------------------
 
     def _send(self, obj):
+        """Write one JSON line. Returns False on a failed or partial write
+        (host not reading), so stream callers can stop rather than desync."""
         try:
-            self._data.write(json.dumps(obj).encode("utf-8"))
-            self._data.write(b"\n")
+            data = json.dumps(obj).encode("utf-8") + b"\n"
+            n = self._data.write(data)
+            if n is not None and n < len(data):
+                return False
             self._data.flush()
+            return True
         except Exception:
-            pass
+            return False
 
     def _handle_line(self, line):
         if not line:
@@ -379,6 +422,9 @@ class SerialHandler:
         cmd = msg.get("cmd")
         if cmd is None:
             self._send({"ok": False, "error": "missing 'cmd' field"})
+            return
+        if not isinstance(cmd, str):
+            self._send({"ok": False, "error": "'cmd' must be a string"})
             return
 
         handler = getattr(self, "_cmd_" + cmd, None)
@@ -440,6 +486,7 @@ class SerialHandler:
             "axes": [a["id"] for a in self._box.config.get("axes", []) if "id" in a],
             "rules_count": len(self._box.rules),
             "board_map": self._box.board_map.get("name", "unknown"),
+            "hash": self._hash_algo,
         })
 
     def _cmd_get_config(self, msg):
@@ -528,6 +575,7 @@ class SerialHandler:
         path = msg.get("path", "")
         size = msg.get("size", 0)
         sha256 = msg.get("sha256", "")
+        sha1 = msg.get("sha1", "")
 
         if not self._is_writable_path(path):
             self._send({"ok": False, "error": "path not allowed: " + str(path)})
@@ -538,25 +586,34 @@ class SerialHandler:
         if not isinstance(sha256, str) or len(sha256) != 64:
             self._send({"ok": False, "error": "sha256 must be a 64-char hex string"})
             return
+        if sha1 and (not isinstance(sha1, str) or len(sha1) != 40):
+            self._send({"ok": False, "error": "sha1 must be a 40-char hex string"})
+            return
 
         dest = ".update/" + path if self._update_mode else path
         self._start_chunk_receive("file_write", size, {
             "path": dest,
+            "real_path": path,
             "sha256": sha256,
+            "sha1": sha1,
         })
 
     def _cmd_update_begin(self, msg):
-        if self._update_mode:
-            self._send({"ok": False, "error": "update already in progress"})
-            return
+        # A previous session may have died mid-update (host crash, unplug).
+        # Discard any stale staging and start clean, instead of wedging every
+        # future update behind an "already in progress" error.
+        self._rmtree(".update")
+        self._update_mode = False
         try:
             os.mkdir(".update")
-        except OSError:
-            pass
-        try:
             os.mkdir(".update/lib")
         except OSError:
             pass
+        try:
+            os.stat(".update/lib")
+        except OSError as e:
+            self._send({"ok": False, "error": "cannot create staging dir: " + str(e)})
+            return
         self._update_mode = True
         self._send({"ok": True, "update_mode": True})
 
@@ -565,8 +622,8 @@ class SerialHandler:
             self._send({"ok": False, "error": "no update in progress"})
             return
         staged = self._list_staged_files(".update")
-        # Commit in dependency order (lib, then boot.py, then code.py) so an
-        # interrupted commit never leaves a new code.py next to old libs.
+        # Commit in dependency order (lib, then boot.py, then code.py) so a
+        # partial commit never runs new code.py against old libs.
         def _commit_rank(item):
             path = item[1]
             if path.startswith("lib/"):
@@ -577,25 +634,37 @@ class SerialHandler:
                 return 3
             return 1
         staged = sorted(staged, key=_commit_rank)
+
+        # Journal the commit before touching any real file. If power is lost
+        # (or an OSError aborts us) mid-way, boot-time recovery reads this
+        # journal and rolls the remaining renames forward — every staged file
+        # was already size- and hash-verified on upload.
+        try:
+            with open(".update/COMMIT", "w") as f:
+                for _, rel in staged:
+                    f.write(rel + "\n")
+        except OSError as e:
+            self._send({"ok": False, "error": "cannot write commit journal: " + str(e)})
+            return
+
         committed = []
         try:
             for staged_path, real_path in staged:
-                try:
-                    os.remove(real_path)
-                except OSError:
-                    pass
                 self._ensure_parent(real_path)
-                os.rename(staged_path, real_path)
+                self._replace_file(staged_path, real_path)
                 committed.append(real_path)
         except OSError as e:
-            # Renames that already landed can't be undone, but the device
-            # reboots cleanly on whatever mix is on flash: code.py went last,
-            # so a partial commit never runs new code against old libs.
-            self._rmtree(".update")
+            # Staging and journal stay on flash: the next boot completes the
+            # commit, or a fresh update_begin discards it for a clean retry.
             self._update_mode = False
             gc.collect()
-            self._send({"ok": False, "error": "commit failed: " + str(e), "rolled_back": True})
+            self._send({"ok": False, "error": "commit failed: " + str(e),
+                        "committed": committed, "recovery": "pending_on_reboot"})
             return
+        try:
+            os.remove(".update/COMMIT")
+        except OSError:
+            pass
         self._rmtree(".update")
         self._update_mode = False
         gc.collect()
@@ -619,15 +688,19 @@ class SerialHandler:
             self._send({"ok": False, "error": "file not found: " + str(path)})
             return
 
-        sha = self._compute_file_hash(path)
+        try:
+            sha = self._compute_file_hash(path)
+        except Exception:
+            sha = ""
+        algo = self._hash_algo if sha else ""
 
         if size <= _CHUNK_SIZE:
             with open(path, "rb") as f:
                 data = f.read()
             encoded = binascii.b2a_base64(data).decode("utf-8").strip()
-            self._send({"ok": True, "size": size, "sha256": sha, "data": encoded})
+            self._send({"ok": True, "size": size, "hash": sha, "hash_algo": algo, "data": encoded})
         else:
-            self._send({"ok": True, "size": size, "sha256": sha, "chunked": True})
+            self._send({"ok": True, "size": size, "hash": sha, "hash_algo": algo, "chunked": True})
             with open(path, "rb") as f:
                 seq = 0
                 while True:
@@ -644,6 +717,10 @@ class SerialHandler:
             self._box.nvm.flush(force=True)
         self._send({"ok": True, "rebooting": True})
         time.sleep(0.1)
+        if msg.get("hard"):
+            # Full chip reset: re-runs boot.py, so USB identity changes and a
+            # freshly flashed boot.py actually take effect.
+            microcontroller.reset()
         supervisor.reload()
 
     def _cmd_bootloader(self, msg):
@@ -659,33 +736,40 @@ class SerialHandler:
     # ------------------------------------------------------------------
 
     def _start_chunk_receive(self, op, size, meta):
-        self._chunk_op = op
-        self._chunk_expect = size
-        self._chunk_seq = 0
-        self._chunk_meta = meta
-        self._chunk_deadline = time.monotonic() + _CHUNK_TIMEOUT
-
+        # Acquire resources first, set _chunk_op last: a MemoryError or OSError
+        # here must leave the handler in command mode, not wedged in a chunk
+        # state with no buffer.
         if op == "file_write":
             path = meta["path"]
             temp = self._temp_path(path)
             self._ensure_parent(temp)
             try:
-                self._chunk_file = open(temp, "wb")
+                chunk_file = open(temp, "wb")
             except OSError as e:
-                self._chunk_op = None
                 self._send({"ok": False, "error": "cannot create temp file: " + str(e)})
                 return
+            self._chunk_file = chunk_file
             self._chunk_buf = None
-            self._chunk_pos = 0
         else:
             # Size is pre-validated against _MAX_CONFIG by the command handlers.
             # The buffer must hold the full declared size: anything smaller makes
             # every transfer past the cap fail with "data exceeds declared size".
             gc.collect()
-            self._chunk_buf = bytearray(size + 256)
-            self._chunk_pos = 0
+            try:
+                buf = bytearray(size + 256)
+            except MemoryError:
+                gc.collect()
+                self._send({"ok": False, "error": "not enough memory for %d byte transfer" % size})
+                return
+            self._chunk_buf = buf
             self._chunk_file = None
 
+        self._chunk_pos = 0
+        self._chunk_expect = size
+        self._chunk_seq = 0
+        self._chunk_meta = meta
+        self._chunk_deadline = time.monotonic() + _CHUNK_TIMEOUT
+        self._chunk_op = op
         self._send({"ok": True, "ready": True})
 
     def _handle_chunk_msg(self, msg):
@@ -701,6 +785,9 @@ class SerialHandler:
                 self._abort_chunk("base64 decode error: " + str(e))
                 return
 
+            if self._chunk_pos + len(decoded) > self._chunk_expect:
+                self._abort_chunk("data exceeds declared size")
+                return
             if self._chunk_file is not None:
                 try:
                     self._chunk_file.write(decoded)
@@ -708,13 +795,13 @@ class SerialHandler:
                     self._abort_chunk("write error: " + str(e))
                     return
                 self._chunk_pos += len(decoded)
-            else:
+            elif self._chunk_buf is not None:
                 end = self._chunk_pos + len(decoded)
-                if end > len(self._chunk_buf):
-                    self._abort_chunk("data exceeds declared size")
-                    return
                 self._chunk_buf[self._chunk_pos:end] = decoded
                 self._chunk_pos = end
+            else:
+                self._abort_chunk("no active transfer buffer")
+                return
 
             self._chunk_seq += 1
             self._chunk_deadline = time.monotonic() + _CHUNK_TIMEOUT
@@ -737,26 +824,47 @@ class SerialHandler:
 
             path = meta["path"]
             temp = self._temp_path(path)
-            expected_hash = meta.get("sha256", "")
 
-            actual_hash = self._compute_file_hash(temp)
-            if expected_hash and actual_hash and actual_hash != expected_hash:
-                try:
-                    os.remove(temp)
-                except OSError:
-                    pass
-                self._chunk_op = None
-                gc.collect()
-                self._send({"ok": False,
-                             "error": "checksum mismatch: expected %s, got %s" % (expected_hash, actual_hash)})
+            # 1. Byte count must match the declared size exactly — an early
+            # {"done": true} or a dropped chunk is a truncated file.
+            if self._chunk_pos != self._chunk_expect:
+                self._fail_file_write(temp, "size mismatch: expected %d bytes, got %d"
+                                      % (self._chunk_expect, self._chunk_pos))
                 return
 
-            try:
+            # 2. Hash check, fail closed: if this build can hash and the host
+            # supplied a digest for that algorithm, a compute failure or a
+            # mismatch rejects the file. (Hosts that only sent an algorithm we
+            # can't compute still get the size check above.)
+            if self._hash_algo:
+                expected_hash = meta.get(self._hash_algo, "")
+                if expected_hash:
+                    try:
+                        actual_hash = self._compute_file_hash(temp)
+                    except Exception as e:
+                        self._fail_file_write(temp, "hash failed: " + str(e))
+                        return
+                    if actual_hash != expected_hash:
+                        self._fail_file_write(temp, "checksum mismatch: expected %s, got %s"
+                                              % (expected_hash, actual_hash))
+                        return
+
+            # 3. A config.json written this way must pass the same validation
+            # as set_config — file_write is not a validation bypass.
+            if meta.get("real_path") == "config.json":
                 try:
-                    os.remove(path)
-                except OSError:
-                    pass
-                os.rename(temp, path)
+                    with open(temp) as f:
+                        cfg = json.load(f)
+                except Exception as e:
+                    self._fail_file_write(temp, "config.json is not valid JSON: " + str(e))
+                    return
+                ok, err = validate_config(cfg, self._box.pin_names)
+                if not ok:
+                    self._fail_file_write(temp, "config.json invalid: " + err)
+                    return
+
+            try:
+                self._replace_file(temp, path)
             except OSError as e:
                 self._chunk_op = None
                 gc.collect()
@@ -769,16 +877,33 @@ class SerialHandler:
             self._send({"ok": True, "written": True, "size": file_size})
 
         elif op in ("set_config", "validate_config"):
-            raw = bytes(self._chunk_buf[:self._chunk_pos])
+            buf = self._chunk_buf
             self._chunk_op = None
-            self._chunk_buf = None
-            gc.collect()
 
+            if self._chunk_pos != self._chunk_expect:
+                self._chunk_buf = None
+                gc.collect()
+                self._send({"ok": False, "error": "size mismatch: expected %d bytes, got %d"
+                            % (self._chunk_expect, self._chunk_pos)})
+                return
+
+            # Parse straight from the receive buffer (no copies on
+            # CircuitPython, whose json.loads accepts any buffer object); the
+            # buffer must stay referenced until json.loads returns. The bytes
+            # fallback keeps this testable on desktop Python.
             try:
-                cfg = json.loads(raw)
+                view = memoryview(buf)[:self._chunk_pos]
+                try:
+                    cfg = json.loads(view)
+                except TypeError:
+                    cfg = json.loads(bytes(view))
             except (ValueError, Exception) as e:
+                self._chunk_buf = None
+                gc.collect()
                 self._send({"ok": False, "error": "invalid JSON: " + str(e)})
                 return
+            self._chunk_buf = None
+            gc.collect()
 
             ok, err = validate_config(cfg, self._box.pin_names)
             if op == "validate_config":
@@ -794,6 +919,37 @@ class SerialHandler:
 
         else:
             self._chunk_op = None
+
+    def _fail_file_write(self, temp, reason):
+        try:
+            os.remove(temp)
+        except OSError:
+            pass
+        self._chunk_op = None
+        gc.collect()
+        self._send({"ok": False, "error": reason})
+
+    def _replace_file(self, src, dst):
+        """Install src as dst without a window where dst is absent.
+
+        Rename-aside: dst -> dst.old, src -> dst, delete dst.old. Interrupted
+        at any point, boot-time recovery (lib/update_recovery.py) restores a
+        consistent state from the .old copy. Raises OSError on failure.
+        """
+        old = dst + ".old"
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+        try:
+            os.rename(dst, old)
+        except OSError:
+            pass  # dst may not exist yet
+        os.rename(src, dst)
+        try:
+            os.remove(old)
+        except OSError:
+            pass
 
     def _abort_chunk(self, reason):
         if self._chunk_file is not None:
@@ -815,10 +971,18 @@ class SerialHandler:
     # ------------------------------------------------------------------
 
     def _write_config_and_reboot(self, cfg):
+        # Write to a temp file and swap it in, so power loss mid-write can
+        # never leave a truncated config.json (which would silently reset the
+        # device to defaults, including its USB identity).
         try:
-            with open("config.json", "w") as f:
+            with open("config.json.tmp", "w") as f:
                 json.dump(cfg, f)
+            self._replace_file("config.json.tmp", "config.json")
         except OSError as e:
+            try:
+                os.remove("config.json.tmp")
+            except OSError:
+                pass
             self._send({"ok": False, "error": "write failed: " + str(e)})
             return
         if self._box.nvm is not None:
@@ -828,18 +992,23 @@ class SerialHandler:
         supervisor.reload()
 
     def _compute_file_hash(self, path):
-        try:
-            import hashlib
-            h = hashlib.new("sha256")
-            with open(path, "rb") as f:
-                while True:
-                    block = f.read(512)
-                    if not block:
-                        break
-                    h.update(block)
-            return binascii.hexlify(h.digest()).decode("utf-8")
-        except (ImportError, Exception):
+        """Hex digest of path using the detected algorithm.
+
+        Raises on any failure — callers decide whether that is fatal (it is,
+        for OTA verification). Returns "" only when this build has no hash
+        support at all.
+        """
+        if not self._hash_algo:
             return ""
+        import hashlib
+        h = hashlib.new(self._hash_algo)
+        with open(path, "rb") as f:
+            while True:
+                block = f.read(512)
+                if not block:
+                    break
+                h.update(block)
+        return binascii.hexlify(h.digest()).decode("utf-8")
 
     def _is_writable_path(self, path):
         if not isinstance(path, str) or ".." in path.split("/"):
@@ -888,12 +1057,21 @@ class SerialHandler:
 
     def _list_staged_files(self, base, prefix=""):
         result = []
-        for entry in os.listdir(base):
+        try:
+            entries = os.listdir(base)
+        except OSError:
+            return result
+        for entry in entries:
+            if not prefix and entry == "COMMIT":
+                continue  # the commit journal is bookkeeping, not payload
             full = base + "/" + entry
-            rel = prefix + entry if not prefix else prefix + "/" + entry
+            rel = entry if not prefix else prefix + "/" + entry
             try:
-                os.listdir(full)
-                result.extend(self._list_staged_files(full, rel))
+                is_dir = bool(os.stat(full)[0] & 0x4000)
             except OSError:
+                continue
+            if is_dir:
+                result.extend(self._list_staged_files(full, rel))
+            else:
                 result.append((full, rel))
         return result
