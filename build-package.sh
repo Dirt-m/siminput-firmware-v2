@@ -36,6 +36,11 @@ for root, dirs, fnames in os.walk('lib'):
 
 manifest = {
     'firmware_version': '$VERSION',
+    # Forward-compat gates, added while the installed base is small:
+    # protocol lets clients know what this package speaks; min_updater_version
+    # lets a package refuse configurators too old to install it safely.
+    'protocol': 2,
+    'min_updater_version': '1.1.0',
     'files': files,
 }
 json.dump(manifest, open('manifest.json', 'w'), indent=2)
