@@ -9,8 +9,9 @@ Part of the open SIMINPUT ecosystem. The firmware, hardware, enclosure CAD, and 
 ## Features
 
 - **Up to 42 physical inputs** depending on board revision (see Hardware below).
-- **Rule engine.** MAP, NOR, TOGGLE, PULSE, ENCODER, AXIS_INC, AXIS_DEC.
+- **Rule engine.** MAP, NOR, TOGGLE, PULSE, ENCODER, AXIS_INC, AXIS_DEC, ANALOG, THRESHOLD.
 - **Rotary encoders.** Hardware decoding (rotaryio/PIO) with automatic software fallback.
+- **Analog sensors.** Pots, hall effect sensors, load cells with an analog front end: any 0 to 3.3 V signal on an ADC pin becomes an axis, with calibration, filtering, deadzone, and response curves in the config. Thresholds turn any analog signal or axis into a button.
 - **Persistent storage.** Bools and axis values survive across power cycles using NVM.
 - **PWM backlight.** Perceptual brightness curve, driven by any axis.
 - **Fast loop.** 200 Hz main loop; GPIO encoders poll at sub millisecond rate, expander encoders at roughly 1 ms per sample (I2C bound).
@@ -25,6 +26,7 @@ Part of the open SIMINPUT ecosystem. The firmware, hardware, enclosure CAD, and 
 - **rev1:** 27 inputs. D1 to D14 on the expander, D15 to D24 direct GPIO, A6 to A8. Backlight PWM on GP12.
 - **rev2:** 42 inputs. D1 to D22 direct GPIO, A1 to A4, D23 to D38 on the expander. Backlight PWM on GP2.
 - All inputs use internal pull-ups, active low (switch closes to GND). A-pins are read as digital inputs like the D-pins, but they are not part of the default passthrough: use them as explicit rule inputs.
+- A-pins sit on the RP2040's ADC inputs (GP26 to GP29). An A-pin named in an ANALOG or THRESHOLD rule is claimed as an analog input instead: no pull-up, 0 to 3.3 V in, sampled every cycle. Never feed an ADC pin more than 3.3 V; a 5 V sensor needs a divider.
 
 ## Project layout
 
@@ -110,6 +112,8 @@ Rules run every cycle (200 Hz) in order. Any pin not claimed by a rule automatic
 | **PULSE** | Fires output for `pulse_ms` after optional `delay_ms` on rising edge |
 | **ENCODER** | Reads a quadrature encoder, produces CW/CCW outputs |
 | **AXIS_INC / AXIS_DEC** | Adjusts an axis value by `step` on rising edge |
+| **ANALOG** | Drives an axis from an analog pin (see Analog inputs below) |
+| **THRESHOLD** | Output is true while an analog pin or axis is above (or below) a level, with hysteresis |
 
 #### Examples
 
@@ -136,6 +140,55 @@ Rules run every cycle (200 Hz) in order. Any pin not claimed by a rule automatic
 { "type": "AXIS_DEC", "input": "B18", "axis": "AX1", "step": 2048 }
 ```
 
+### Analog inputs
+
+An ANALOG rule reads one A-pin and writes one axis. The sample runs through a fixed pipeline, every stage optional:
+
+```
+sample → filter → range (min/max, or min/center/max with deadzone) → invert → curve → hysteresis → axis
+```
+
+All values are in the ADC's 16 bit scale, 0 to 65535 (0 V to 3.3 V). A pot wired across 3.3 V and GND needs nothing but the pin and the axis:
+
+```json
+{ "type": "ANALOG", "input": "A1", "axis": "AX1" }
+```
+
+A hall effect pedal only swings over part of the range, so give it the resting and fully pressed readings. The configurator's live view shows the raw value of every analog pin for exactly this:
+
+```json
+{ "type": "ANALOG", "input": "A2", "axis": "THROTTLE", "min": 9800, "max": 41200, "filter": 3, "curve": 1.4 }
+```
+
+A centered sensor (steering, a joystick axis) gets a `center` and a `deadzone` around it. Each side scales over its own span, so a rest position that is not exactly halfway still reaches both ends:
+
+```json
+{ "type": "ANALOG", "input": "A3", "axis": "STEER", "min": 1200, "center": 31900, "max": 64000, "deadzone": 400 }
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `input` | | An A-pin. Once claimed here it cannot be used as a digital input anywhere else |
+| `axis` | | Axis id to drive. That axis cannot use `store` or be the target of AXIS_INC/AXIS_DEC |
+| `min`, `max` | 0, 65535 | Raw readings that map to axis 0 and 65535. Readings outside clamp |
+| `center` | none | Raw reading that maps to 32767. Must lie between `min` and `max` |
+| `deadzone` | 0 | Raw counts either side of `center` that read as centered. Needs `center` |
+| `invert` | false | Flip direction (mirrors about the center when one is set) |
+| `filter` | 2 | Exponential smoothing, 0 to 8. Time constant is about 2^n cycles at 200 Hz, so 2 is 20 ms and 5 is 160 ms. 0 disables it |
+| `hysteresis` | 0 | Ignore output changes smaller than this, except at the ends of the range. Useful to keep a noisy sensor from sending reports at 200 Hz |
+| `curve` | 1 | A number is an exponent on the normalised value: above 1 softens the start of travel, below 1 sharpens it. On a centered axis it applies to each side. A list of `[in, out]` points (2 to 32, inputs strictly increasing) is a piecewise linear table over 0 to 65535 for sensors with a known nonlinearity |
+
+The RP2040 ADC is 12 bit and noisy by a few counts (a few hundred in 16 bit terms). The default filter takes most of that out; add `hysteresis` if the axis still jitters in games.
+
+THRESHOLD makes a button out of an analog signal. The input is either an A-pin (compared against the raw sample, unfiltered) or an axis id (compared against its current value, so a filtered ANALOG axis or an encoder driven axis both work). Set exactly one of `above` or `below`. `hysteresis` is how far the value has to come back before the output drops again. The output is a normal rule output, so it can feed TOGGLE, PULSE, or a bool:
+
+```json
+{ "type": "THRESHOLD", "input": "A4", "output": "B40", "above": 30000, "hysteresis": 1500 },
+{ "type": "THRESHOLD", "input": "THROTTLE", "output": "B41", "below": 500 }
+```
+
+Analog values are never stored in NVM: the sensor is read again at boot. Outputs that depend on a threshold are settled before the first HID report, so a TOGGLE fed by a THRESHOLD does not flip at power-on just because the sensor rests above its level.
+
 ## Serial protocol
 
 The device exposes a second USB CDC serial port for configuration and monitoring. Commands are line delimited JSON.
@@ -156,12 +209,12 @@ The device exposes a second USB CDC serial port for configuration and monitoring
 | `bootloader` | Enter UF2 bootloader mode |
 | `update_begin` / `update_commit` / `update_abort` | Staged (transactional) firmware updates |
 
-Requests may carry an `"id"` field, echoed on the reply. `get_info` reports the protocol revision, capabilities, transfer limits, and the board's pin list.
+Requests may carry an `"id"` field, echoed on the reply. `get_info` reports the protocol revision, capabilities, transfer limits, the board's pin list, its ADC capable pins (`analog_pins`), and the pins the running config has claimed as analog (`analog_active`). `get_state` and stream frames carry the raw 16 bit sample of every claimed analog pin (`analog` in `get_state`, `an` in a stream frame, resent whenever a pin moves by more than the ADC noise floor).
 
 Example:
 ```
 -> {"cmd": "ping"}
-<- {"ok": true, "product": "SIMINPUT", "version": "2.6.0", "protocol": 2, "name": "My Button Box", "pid": 61440, "board_map": "rev2"}
+<- {"ok": true, "product": "SIMINPUT", "version": "2.7.0", "protocol": 2, "name": "My Button Box", "pid": 61440, "board_map": "rev2"}
 ```
 
 ## Firmware packaging
