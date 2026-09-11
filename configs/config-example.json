@@ -9,7 +9,9 @@
         { "id": "TOGGLE1", "default": false, "store": true }
     ],
     "axes": [
-        { "id": "AX1", "output": 1, "default": 32767, "store": true, "backlight": true }
+        { "id": "AX1", "output": 1, "default": 32767, "store": true, "backlight": true },
+        { "id": "THROTTLE", "output": 2 },
+        { "id": "STEER", "output": 3 }
     ],
     "rules": [
         { "type": "MAP", "input": "D1", "output": "B50", "invert": true },
@@ -23,6 +25,11 @@
 
         { "type": "ENCODER", "inputs": ["D17", "D18"], "cw": "B17", "ccw": "B18" },
         { "type": "AXIS_INC", "input": "B17", "axis": "AX1", "step": 2048 },
-        { "type": "AXIS_DEC", "input": "B18", "axis": "AX1", "step": 2048 }
+        { "type": "AXIS_DEC", "input": "B18", "axis": "AX1", "step": 2048 },
+
+        { "type": "ANALOG", "input": "A1", "axis": "THROTTLE", "min": 9800, "max": 41200, "filter": 3, "curve": 1.4 },
+        { "type": "ANALOG", "input": "A2", "axis": "STEER", "min": 1200, "center": 31900, "max": 64000, "deadzone": 400 },
+        { "type": "THRESHOLD", "input": "A3", "output": "B40", "above": 30000, "hysteresis": 1500 },
+        { "type": "THRESHOLD", "input": "THROTTLE", "output": "B41", "below": 500 }
     ]
 }

@@ -1,3 +1,4 @@
+import analogio
 import board
 import busio
 import digitalio
@@ -11,7 +12,7 @@ import os
 import microcontroller
 import supervisor
 from community_tca9555 import TCA9555
-from serial_handler import SerialHandler
+from serial_handler import SerialHandler, analog_pins_used
 
 # Finish or clean up any interrupted OTA update. boot.py already ran this,
 # but running it again here is idempotent and covers the transitional case of
@@ -104,13 +105,16 @@ def _board_map(rev):
         for i in range(10):
             pins["D%d" % (i + 15)] = {"type": "gpio", "pin": i + 14}
         for i in range(3):
-            pins["A%d" % (i + 6)] = {"type": "gpio", "pin": i + 27}
+            pins["A%d" % (i + 6)] = {"type": "gpio", "pin": i + 27, "adc": True}
         return {"name": "rev1", "backlight": 12, "pins": pins}
     if rev == "rev2":
         for i in range(22):
             pins["D%d" % (i + 1)] = {"type": "gpio", "pin": i + 4}
+        # GP26-29 are the RP2040's four ADC inputs. "adc" marks a pin the
+        # config may claim as an analog input (ANALOG / THRESHOLD rules); left
+        # unclaimed, it is a plain pulled-up digital input like any other.
         for i in range(4):
-            pins["A%d" % (i + 1)] = {"type": "gpio", "pin": i + 26}
+            pins["A%d" % (i + 1)] = {"type": "gpio", "pin": i + 26, "adc": True}
         for i in range(16):
             pins["D%d" % (i + 23)] = {"type": "expander", "pin": i}
         return {"name": "rev2", "backlight": 2, "pins": pins}
@@ -251,6 +255,16 @@ class ButtonBox:
         self.board_map = self._detect_board()
         self.pin_map = self.board_map.get("pins", {})
         self.pin_names = frozenset(self.pin_map.keys())
+        # ADC-capable pins, and the subset this config actually uses as
+        # analog inputs. Decided before hardware init because the same pin is
+        # claimed either as AnalogIn or as a pulled-up DigitalInOut, never both.
+        self.analog_pin_names = frozenset(
+            n for n, d in self.pin_map.items() if d.get("adc"))
+        try:
+            self._analog_requested = analog_pins_used(self.config) & self.analog_pin_names
+        except Exception as e:
+            print("analog pin scan failed:", e)
+            self._analog_requested = frozenset()
         self._init_hardware()
         self.nvm    = None   # set by _parse_config; pre-initialised so fallback is safe
         try:
@@ -336,14 +350,31 @@ class ButtonBox:
         else:
             self.expander = None
 
-        self.gpio_pins = {}
+        self.gpio_pins  = {}
+        self.analog_ins = {}    # pin name → analogio.AnalogIn
+        self.analog_raw = {}    # pin name → last 16-bit ADC sample (pre-sized, no per-cycle allocation)
         for name, data in self.pin_map.items():
-            if data['type'] == 'gpio':
-                pin_obj = _gpio_pin(data["pin"])
-                pin = digitalio.DigitalInOut(pin_obj)
-                pin.direction = digitalio.Direction.INPUT
-                pin.pull      = digitalio.Pull.UP
-                self.gpio_pins[name] = pin
+            if data['type'] != 'gpio':
+                continue
+            pin_obj = _gpio_pin(data["pin"])
+            if name in self._analog_requested:
+                try:
+                    self.analog_ins[name] = analogio.AnalogIn(pin_obj)
+                    self.analog_raw[name] = 0
+                    continue
+                except Exception as e:
+                    # Fall through to a digital claim so the pin is at least
+                    # owned. Rules that need it are dropped at parse time
+                    # (their axis keeps its default) and the box keeps running.
+                    print("AnalogIn init failed for", name, e)
+            pin = digitalio.DigitalInOut(pin_obj)
+            pin.direction = digitalio.Direction.INPUT
+            pin.pull      = digitalio.Pull.UP
+            self.gpio_pins[name] = pin
+        # Pins the debounced digital scan covers: everything except the
+        # analog claims (an ADC pin has no meaningful on/off level).
+        self._digital_pins = [(n, d) for n, d in self.pin_map.items()
+                              if n not in self.analog_ins]
 
         bl_n = self.board_map.get("backlight")
         self.backlight_pwm = None
@@ -457,6 +488,11 @@ class ButtonBox:
         # correctly rather than capping at one step per cycle.
         self.encoder_axis_links      = {}
         self.encoder_linked_axis_rules = set()   # these AXIS rules are skipped in the main loop
+        # Analog rules: rule_idx → parsed tuple (see _parse_analog_rule) and a
+        # mutable [filter_acc, last_out] state updated in place each cycle.
+        self.analog_cfg    = {}
+        self.analog_state  = {}
+        self.threshold_cfg = {}   # rule_idx → parsed tuple (see _parse_threshold_rule)
 
         # Pass 1 — collect encoder outputs for:
         #   a) single-cycle zero-at-start mechanism (pulse_ms=0)
@@ -545,6 +581,18 @@ class ButtonBox:
                     ref = rule.get(key, "")
                     if ref.startswith("B") and ref[1:].isdigit():
                         self.claimed_b.add(int(ref[1:]))
+            elif rtype == "ANALOG":
+                parsed = self._parse_analog_rule(rule)
+                if parsed is not None:
+                    self.analog_cfg[i]   = parsed
+                    self.analog_state[i] = [-1, -1]
+            elif rtype == "THRESHOLD":
+                parsed = self._parse_threshold_rule(rule)
+                if parsed is not None:
+                    self.threshold_cfg[i] = parsed
+                    out = rule.get("output", "")
+                    if out.startswith("B") and out[1:].isdigit():
+                        self.claimed_b.add(int(out[1:]))
             else:
                 out = rule.get("output", "")
                 if out.startswith("B") and out[1:].isdigit():
@@ -620,9 +668,15 @@ class ButtonBox:
         chains through one level of forward references.
         """
         for _ in range(2):
-            for rule in self.rules:
+            for i, rule in enumerate(self.rules):
                 rtype = rule.get("type", "")
-                if rtype == "MAP":
+                if rtype == "ANALOG":
+                    if i in self.analog_cfg:
+                        self.axis_states[self.analog_cfg[i][1]] = self._eval_analog(i)
+                elif rtype == "THRESHOLD":
+                    if i in self.threshold_cfg:
+                        self._write_output_seed(rule.get("output", ""), self._eval_threshold(i))
+                elif rtype == "MAP":
                     val = self._read_input(rule.get("input", ""))
                     if rule.get("invert", False):
                         val = not val
@@ -645,6 +699,204 @@ class ButtonBox:
             self.bool_states[ref] = value
 
     # ------------------------------------------------------------------
+    # Analog inputs
+    # ------------------------------------------------------------------
+    # An ANALOG rule turns one ADC pin into one axis through a fixed pipeline,
+    # all in integer math on the 16-bit sample (0-65535):
+    #
+    #   sample → filter (EMA) → range (min/max, optional center + deadzone)
+    #          → invert → curve (exponent or point table) → hysteresis → axis
+    #
+    # Every stage has a neutral default, so a pot wired rail-to-rail works with
+    # just {"input": "A1", "axis": "AX1"}; a hall sensor with a narrow swing
+    # gets min/max from the configurator's calibration (raw values are exposed
+    # over serial for exactly that), and a centered stick adds center/deadzone.
+
+    @staticmethod
+    def _int_in(value, default, lo, hi):
+        try:
+            v = int(value)
+        except (TypeError, ValueError):
+            return default
+        return max(lo, min(hi, v))
+
+    def _parse_analog_rule(self, rule):
+        """Return the runtime tuple for an ANALOG rule, or None if unusable.
+        validate_config already rejected bad configs over serial; this only
+        has to be safe against a hand-edited config.json."""
+        pin  = rule.get("input", "")
+        axis = rule.get("axis", "")
+        if pin not in self.analog_ins or axis not in self.axis_states:
+            return None
+        lo = self._int_in(rule.get("min", 0),     0,     0, 65535)
+        hi = self._int_in(rule.get("max", 65535), 65535, 0, 65535)
+        if hi <= lo:
+            return None
+        center = rule.get("center")
+        dz     = 0
+        if center is not None:
+            center = self._int_in(center, -1, 0, 65535)
+            dz     = self._int_in(rule.get("deadzone", 0), 0, 0, 65535)
+            if not (lo < center - dz and center + dz < hi):
+                return None
+        filt = self._int_in(rule.get("filter", 2), 2, 0, 8)
+        hyst = self._int_in(rule.get("hysteresis", 0), 0, 0, 65535)
+
+        # curve: a number is an exponent on the normalised value (1 = linear),
+        # a list of [in, out] points is a piecewise-linear table over 0-65535.
+        curve_exp = 0.0
+        curve_tab = None
+        curve = rule.get("curve", 1)
+        if isinstance(curve, (list, tuple)):
+            pts = []
+            for p in curve:
+                try:
+                    pts.append((int(p[0]), int(p[1])))
+                except Exception:
+                    pts = []
+                    break
+            if len(pts) >= 2:
+                pts.sort()
+                curve_tab = tuple(pts)
+        else:
+            try:
+                curve_exp = float(curve)
+            except (TypeError, ValueError):
+                curve_exp = 1.0
+            if not (0.0 < curve_exp <= 10.0) or curve_exp == 1.0:
+                curve_exp = 0.0     # 0 = skip the pow() stage
+        return (pin, axis, lo, hi, center, dz, bool(rule.get("invert", False)),
+                filt, hyst, curve_exp, curve_tab)
+
+    def _parse_threshold_rule(self, rule):
+        """Return (source_is_pin, source, threshold, hysteresis, above, invert)
+        or None. Source is an analog pin (raw sample) or an axis id (its
+        current 0-65535 value, so any axis can become a button)."""
+        src = rule.get("input", "")
+        if src in self.analog_ins:
+            is_pin = True
+        elif src in self.axis_states:
+            is_pin = False
+        else:
+            return None
+        if "above" in rule:
+            thr, above = self._int_in(rule.get("above"), -1, 0, 65535), True
+        elif "below" in rule:
+            thr, above = self._int_in(rule.get("below"), -1, 0, 65535), False
+        else:
+            return None
+        if thr < 0:
+            return None
+        hyst = self._int_in(rule.get("hysteresis", 0), 0, 0, 65535)
+        return (is_pin, src, thr, hyst, above, bool(rule.get("invert", False)))
+
+    def _read_analog(self):
+        """One ADC conversion per claimed pin per cycle (a few µs each).
+        A failed read keeps the previous sample rather than injecting a 0."""
+        for name, ain in self.analog_ins.items():
+            try:
+                self.analog_raw[name] = ain.value
+            except Exception:
+                pass
+
+    def _eval_analog(self, i):
+        """Run the pipeline for ANALOG rule i and return the axis value."""
+        (pin, _axis, lo, hi, center, dz, invert,
+         filt, hyst, curve_exp, curve_tab) = self.analog_cfg[i]
+        state = self.analog_state[i]
+        raw   = self.analog_raw.get(pin, 0)
+
+        # Exponential moving average in fixed point: acc holds value << filt,
+        # so the update is exact (an int shift of a signed delta would never
+        # close the last few counts). Seeded from the first sample, no ramp-up.
+        if filt:
+            acc = state[0]
+            if acc < 0:
+                acc = raw << filt
+            else:
+                acc += raw - (acc >> filt)
+            state[0] = acc
+            raw = acc >> filt
+
+        if center is None:
+            x = raw - lo
+            if x <= 0:
+                out = 0
+            else:
+                span = hi - lo
+                out  = 65535 if x >= span else (x * 65535) // span
+            if invert:
+                out = 65535 - out
+        else:
+            # Centered: each side scales over its own span, so an off-center
+            # rest position still reaches both rails. Invert swaps the sides
+            # (mirrors about 32767) instead of complementing the value, which
+            # would shift the rest position by one count.
+            if raw >= center:
+                d    = raw - center - dz
+                span = hi - center - dz
+            else:
+                d    = center - raw - dz
+                span = center - lo - dz
+            up = (raw >= center) != invert
+            if d <= 0:
+                out = 32767
+            elif d >= span:
+                out = 65535 if up else 0
+            elif up:
+                out = 32767 + (d * 32768) // span
+            else:
+                out = 32767 - (d * 32767) // span
+
+        if curve_exp:
+            if center is None:
+                out = int((out / 65535.0) ** curve_exp * 65535.0 + 0.5)
+            else:
+                d = out - 32767
+                m = int((abs(d) / 32767.0) ** curve_exp * 32767.0 + 0.5)
+                out = 32767 + m if d >= 0 else 32767 - m
+            out = max(0, min(65535, out))
+        elif curve_tab is not None:
+            out = self._apply_curve_table(curve_tab, out)
+
+        # Hysteresis: ignore output wobble smaller than `hyst`, except at the
+        # rails so a pedal still rests at exactly 0 or 65535.
+        last = state[1]
+        if hyst and last >= 0 and 0 < out < 65535 and abs(out - last) < hyst:
+            out = last
+        state[1] = out
+        return out
+
+    @staticmethod
+    def _apply_curve_table(pts, x):
+        if x <= pts[0][0]:
+            return pts[0][1]
+        n = len(pts)
+        if x >= pts[n - 1][0]:
+            return pts[n - 1][1]
+        for k in range(1, n):
+            x1, y1 = pts[k]
+            if x <= x1:
+                x0, y0 = pts[k - 1]
+                if x1 == x0:
+                    return y1
+                return max(0, min(65535, y0 + ((x - x0) * (y1 - y0)) // (x1 - x0)))
+        return pts[n - 1][1]
+
+    def _eval_threshold(self, i):
+        """Compare the source against the threshold with hysteresis; the
+        rule's prev_input slot holds the current on/off state."""
+        is_pin, src, thr, hyst, above, invert = self.threshold_cfg[i]
+        value = self.analog_raw.get(src, 0) if is_pin else self.axis_states.get(src, 32767)
+        prev  = self.rule_prev_input[i]
+        if above:
+            on = value > thr - hyst if prev else value >= thr
+        else:
+            on = value < thr + hyst if prev else value <= thr
+        self.rule_prev_input[i] = on
+        return (not on) if invert else on
+
+    # ------------------------------------------------------------------
     # Pin reading
     # ------------------------------------------------------------------
 
@@ -655,8 +907,11 @@ class ButtonBox:
         except Exception:
             port0, port1 = 0, 0
 
+        if self.analog_ins:
+            self._read_analog()
+
         now = supervisor.ticks_ms()
-        for name, data in self.pin_map.items():
+        for name, data in self._digital_pins:
             if data['type'] == 'gpio':
                 pin = self.gpio_pins.get(name)
                 # Encoder GPIO pins are owned by rotaryio and are absent from gpio_pins.
@@ -953,6 +1208,17 @@ class ButtonBox:
                     # Apply multi-step delta directly to linked axes so fast
                     # spinning never loses steps (each step is always counted).
                     self._apply_encoder_axes(i, direction, steps)
+
+            elif rtype == "ANALOG":
+                if i in self.analog_cfg:
+                    # Direct assignment: an analog axis is never NVM-stored
+                    # (validate_config rejects "store" on it), its value is
+                    # simply re-read at boot.
+                    self.axis_states[self.analog_cfg[i][1]] = self._eval_analog(i)
+
+            elif rtype == "THRESHOLD":
+                if i in self.threshold_cfg:
+                    self._write_output(rule.get("output", ""), self._eval_threshold(i))
 
             elif rtype in ("AXIS_INC", "AXIS_DEC"):
                 # Encoder-linked AXIS rules are handled inside the ENCODER block above

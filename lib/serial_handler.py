@@ -7,7 +7,7 @@ import sys
 import microcontroller
 import supervisor
 
-FW_VERSION = "2.6.0"
+FW_VERSION = "2.7.0"
 PROTOCOL = 2
 
 _MAX_LINE = 4096
@@ -15,6 +15,9 @@ _CHUNK_SIZE = 2048
 _CHUNK_TIMEOUT_MS = 30000
 _STREAM_MIN_MS = 20
 _MAX_CONFIG = 32768
+# Raw ADC samples in the stream are re-sent once any one moves by this much
+# (about 4 LSB of the 12-bit converter, i.e. its own noise floor).
+_ANALOG_STREAM_DELTA = 64
 
 # supervisor.ticks_ms wraps at 2**29; use ticks_diff for every comparison.
 # time.monotonic is unusable for firmware timing: CircuitPython floats are
@@ -30,14 +33,42 @@ def ticks_diff(a, b):
 _ALLOWED_WRITE_PATHS = {"config.json", "code.py", "boot.py"}
 _ALLOWED_WRITE_PREFIXES = ("lib/",)
 
-_VALID_RULE_TYPES = {"MAP", "NOR", "TOGGLE", "PULSE", "ENCODER", "AXIS_INC", "AXIS_DEC"}
+_VALID_RULE_TYPES = {"MAP", "NOR", "TOGGLE", "PULSE", "ENCODER", "AXIS_INC", "AXIS_DEC",
+                     "ANALOG", "THRESHOLD"}
+
+
+def analog_pins_used(cfg):
+    """Inputs a config reads as analog: the input of every ANALOG and
+    THRESHOLD rule. Callers intersect the result with the board's pin list
+    (a THRESHOLD input may also be an axis id). Shared by code.py (decides
+    AnalogIn vs DigitalInOut at hardware init) and validate_config (forbids
+    using the same pin as a digital input), so the two can never disagree.
+    Tolerates garbage: returns only string inputs, never raises on shape."""
+    used = set()
+    if not isinstance(cfg, dict):
+        return used
+    rules = cfg.get("rules", [])
+    if not isinstance(rules, list):
+        return used
+    for r in rules:
+        if isinstance(r, dict) and r.get("type") in ("ANALOG", "THRESHOLD"):
+            inp = r.get("input", "")
+            if isinstance(inp, str) and inp:
+                used.add(inp)
+    return used
+
+
+def _is_int(v):
+    return isinstance(v, int) and not isinstance(v, bool)
 
 
 # ---------------------------------------------------------------------------
 # Config validation
 # ---------------------------------------------------------------------------
 
-def validate_config(cfg, pin_names):
+def validate_config(cfg, pin_names, analog_pins=frozenset()):
+    """Validate a config against this board's pin list. `analog_pins` is the
+    subset of pin_names that can be claimed as ADC inputs."""
     if not isinstance(cfg, dict):
         return False, "config must be a JSON object"
 
@@ -142,7 +173,18 @@ def validate_config(cfg, pin_names):
     if len(rules) > 256:
         return False, "too many rules (max 256)"
 
+    # Pins claimed as analog by ANALOG/THRESHOLD rules. Collected up front so
+    # a digital rule earlier in the list can't slip a reference past the check.
+    analog_used = analog_pins_used(cfg)
+    # THRESHOLD may also read an axis id; only real pins matter here.
+    analog_used = {p for p in analog_used if p in pin_names}
+    for p in analog_used:
+        if p not in analog_pins:
+            return False, "pin '%s' is not analog capable on this board" % p
+
     def _valid_input(ref):
+        if ref in analog_used:
+            return False   # claimed as analog: it has no digital level to read
         if ref in pin_names:
             return True
         if isinstance(ref, str) and ref.startswith("B") and ref[1:].isdigit():
@@ -157,6 +199,25 @@ def validate_config(cfg, pin_names):
         if ref == "REFRESH":
             return True
         return ref in all_ids
+
+    # Axes driven by an ANALOG rule are overwritten every cycle, so they can't
+    # also be stepped by AXIS_INC/DEC or restored from NVM. Collected first
+    # because the AXIS rule may come before the ANALOG rule in the list.
+    analog_axes = {}
+    stored_axes = {a["id"] for a in axes
+                   if isinstance(a, dict) and "id" in a and a.get("store", False)}
+    for i, r in enumerate(rules):
+        if isinstance(r, dict) and r.get("type") == "ANALOG":
+            axis = r.get("axis", "")
+            if axis not in axis_ids:
+                return False, "rules[%d] ANALOG: axis '%s' is not declared" % (i, axis)
+            if axis in analog_axes:
+                return False, "rules[%d] ANALOG: axis '%s' is already driven by rules[%d]" % (
+                    i, axis, analog_axes[axis])
+            if axis in stored_axes:
+                return False, "rules[%d] ANALOG: axis '%s' cannot use store (its value comes from the sensor)" % (
+                    i, axis)
+            analog_axes[axis] = i
 
     encoder_pins = set()
     for i, r in enumerate(rules):
@@ -209,6 +270,8 @@ def validate_config(cfg, pin_names):
             for inp in inputs:
                 if inp not in pin_names:
                     return False, "rules[%d] ENCODER: '%s' is not a valid pin name" % (i, inp)
+                if inp in analog_used:
+                    return False, "rules[%d] ENCODER: pin '%s' is claimed as an analog input" % (i, inp)
                 if inp in encoder_pins:
                     return False, "rules[%d] ENCODER: pin '%s' is already used by another encoder" % (i, inp)
                 encoder_pins.add(inp)
@@ -230,10 +293,79 @@ def validate_config(cfg, pin_names):
             axis = r.get("axis", "")
             if axis not in axis_ids:
                 return False, "rules[%d] %s: axis '%s' is not declared" % (i, rtype, axis)
+            if axis in analog_axes:
+                return False, "rules[%d] %s: axis '%s' is driven by an ANALOG rule" % (i, rtype, axis)
             if "step" in r:
                 s = r["step"]
                 if not isinstance(s, int) or s < 1 or s > 65535:
                     return False, "rules[%d] %s: step must be 1-65535" % (i, rtype)
+
+        elif rtype == "ANALOG":
+            inp = r.get("input", "")
+            if inp not in analog_pins:
+                return False, "rules[%d] ANALOG: input '%s' is not an analog pin" % (i, inp)
+            # axis checked in the pre-pass above
+            lo = r.get("min", 0)
+            hi = r.get("max", 65535)
+            for key, v in (("min", lo), ("max", hi)):
+                if not _is_int(v) or v < 0 or v > 65535:
+                    return False, "rules[%d] ANALOG: %s must be an integer 0-65535" % (i, key)
+            if hi <= lo:
+                return False, "rules[%d] ANALOG: max must be greater than min" % i
+            center = r.get("center")
+            dz = r.get("deadzone", 0)
+            if not _is_int(dz) or dz < 0 or dz > 65535:
+                return False, "rules[%d] ANALOG: deadzone must be an integer 0-65535" % i
+            if center is not None:
+                if not _is_int(center) or center < 0 or center > 65535:
+                    return False, "rules[%d] ANALOG: center must be an integer 0-65535" % i
+                if not (lo < center - dz and center + dz < hi):
+                    return False, "rules[%d] ANALOG: center +/- deadzone must lie strictly between min and max" % i
+            elif dz:
+                return False, "rules[%d] ANALOG: deadzone requires center" % i
+            if "filter" in r:
+                f = r["filter"]
+                if not _is_int(f) or f < 0 or f > 8:
+                    return False, "rules[%d] ANALOG: filter must be an integer 0-8" % i
+            if "hysteresis" in r:
+                h = r["hysteresis"]
+                if not _is_int(h) or h < 0 or h > 65535:
+                    return False, "rules[%d] ANALOG: hysteresis must be an integer 0-65535" % i
+            if "curve" in r:
+                curve = r["curve"]
+                if isinstance(curve, list):
+                    if len(curve) < 2 or len(curve) > 32:
+                        return False, "rules[%d] ANALOG: curve table needs 2-32 points" % i
+                    last_x = -1
+                    for p in curve:
+                        if (not isinstance(p, list) or len(p) != 2
+                                or not _is_int(p[0]) or not _is_int(p[1])
+                                or p[0] < 0 or p[0] > 65535 or p[1] < 0 or p[1] > 65535):
+                            return False, "rules[%d] ANALOG: curve points must be [in, out] integer pairs 0-65535" % i
+                        if p[0] <= last_x:
+                            return False, "rules[%d] ANALOG: curve point inputs must be strictly increasing" % i
+                        last_x = p[0]
+                elif isinstance(curve, (int, float)) and not isinstance(curve, bool):
+                    if curve <= 0 or curve > 10:
+                        return False, "rules[%d] ANALOG: curve exponent must be > 0 and <= 10" % i
+                else:
+                    return False, "rules[%d] ANALOG: curve must be a number or a list of [in, out] points" % i
+
+        elif rtype == "THRESHOLD":
+            inp = r.get("input", "")
+            if inp not in analog_pins and inp not in axis_ids:
+                return False, "rules[%d] THRESHOLD: input '%s' must be an analog pin or an axis id" % (i, inp)
+            if not _valid_output(r.get("output", "")):
+                return False, "rules[%d] THRESHOLD: invalid output '%s'" % (i, r.get("output", ""))
+            if ("above" in r) == ("below" in r):
+                return False, "rules[%d] THRESHOLD: set exactly one of above / below" % i
+            thr = r.get("above", r.get("below"))
+            if not _is_int(thr) or thr < 0 or thr > 65535:
+                return False, "rules[%d] THRESHOLD: threshold must be an integer 0-65535" % i
+            if "hysteresis" in r:
+                h = r["hysteresis"]
+                if not _is_int(h) or h < 0 or h > 65535:
+                    return False, "rules[%d] THRESHOLD: hysteresis must be an integer 0-65535" % i
 
     return True, ""
 
@@ -268,6 +400,7 @@ class SerialHandler:
         self._stream_prev_btns = None
         self._stream_prev_axes = None
         self._stream_prev_pins = None
+        self._stream_prev_analog = None
         self._reply_id = None
 
         try:
@@ -302,6 +435,9 @@ class SerialHandler:
         except ImportError:
             pass
         self._discarding = False
+
+    def _analog_pins(self):
+        return getattr(self._box, "analog_pin_names", frozenset())
 
     # ------------------------------------------------------------------
     # Main entry points (called from ButtonBox.update)
@@ -374,11 +510,26 @@ class SerialHandler:
             if self._stream_prev_pins is None or self._stream_prev_pins.get(name) != val:
                 pins_changed[name] = val
 
+        # Raw ADC samples, for the configurator's calibration view. Re-sent as
+        # a whole once any pin drifts past the noise floor since the last frame.
+        analog = getattr(box, "analog_raw", None)
+        analog_changed = False
+        if analog:
+            prev = self._stream_prev_analog
+            if prev is None:
+                analog_changed = True
+            else:
+                for name, val in analog.items():
+                    p = prev.get(name)
+                    if p is None or abs(val - p) >= _ANALOG_STREAM_DELTA:
+                        analog_changed = True
+                        break
+
         btns_tuple = tuple(active_btns)
         axes_tuple = tuple(axes)
         changed = (btns_tuple != self._stream_prev_btns
                    or axes_tuple != self._stream_prev_axes
-                   or pins_changed)
+                   or pins_changed or analog_changed)
 
         if not changed:
             return
@@ -386,6 +537,8 @@ class SerialHandler:
         msg = {"s": {"b": active_btns, "a": axes}}
         if pins_changed:
             msg["s"]["p"] = pins_changed
+        if analog_changed:
+            msg["s"]["an"] = dict(analog)
         if not self._send(msg):
             self._streaming = False
             return
@@ -396,6 +549,8 @@ class SerialHandler:
             self._stream_prev_pins = dict(box.pin_cache)
         else:
             self._stream_prev_pins.update(pins_changed)
+        if analog_changed:
+            self._stream_prev_analog = dict(analog)
 
     # ------------------------------------------------------------------
     # Transport
@@ -513,9 +668,14 @@ class SerialHandler:
             "rules_count": len(self._box.rules),
             "board_map": self._box.board_map.get("name", "unknown"),
             "hash": self._hash_algo,
-            "caps": ["staged_update", "hard_reboot", "stream", "chunked_config", "request_id"],
+            "caps": ["staged_update", "hard_reboot", "stream", "chunked_config", "request_id",
+                     "analog"],
             "limits": {"max_line": _MAX_LINE, "chunk": _CHUNK_SIZE, "max_config": _MAX_CONFIG},
             "pins": sorted(self._box.pin_names),
+            # ADC-capable pins on this board, and the ones the running config
+            # has actually claimed as analog inputs.
+            "analog_pins": sorted(self._analog_pins()),
+            "analog_active": sorted(getattr(self._box, "analog_ins", {})),
             "fault": getattr(self._box, "fault", ""),
         })
 
@@ -542,7 +702,7 @@ class SerialHandler:
             self._send({"ok": False, "error": "missing 'config' field"})
             return
 
-        ok, err = validate_config(cfg, self._box.pin_names)
+        ok, err = validate_config(cfg, self._box.pin_names, self._analog_pins())
         if not ok:
             self._send({"ok": False, "error": err})
             return
@@ -562,7 +722,7 @@ class SerialHandler:
             self._send({"ok": False, "error": "missing 'config' field"})
             return
 
-        ok, err = validate_config(cfg, self._box.pin_names)
+        ok, err = validate_config(cfg, self._box.pin_names, self._analog_pins())
         if ok:
             self._send({"ok": True, "valid": True})
         else:
@@ -582,6 +742,7 @@ class SerialHandler:
             "axes": axes,
             "bools": dict(box.bool_states),
             "pins": dict(box.pin_cache),
+            "analog": dict(getattr(box, "analog_raw", {})),
         })
 
     def _cmd_stream_start(self, msg):
@@ -594,6 +755,7 @@ class SerialHandler:
         self._stream_prev_btns = None
         self._stream_prev_axes = None
         self._stream_prev_pins = None
+        self._stream_prev_analog = None
         self._send({"ok": True})
 
     def _cmd_stream_stop(self, msg):
@@ -887,7 +1049,7 @@ class SerialHandler:
                 except Exception as e:
                     self._fail_file_write(temp, "config.json is not valid JSON: " + str(e))
                     return
-                ok, err = validate_config(cfg, self._box.pin_names)
+                ok, err = validate_config(cfg, self._box.pin_names, self._analog_pins())
                 if not ok:
                     self._fail_file_write(temp, "config.json invalid: " + err)
                     return
@@ -934,7 +1096,7 @@ class SerialHandler:
             self._chunk_buf = None
             gc.collect()
 
-            ok, err = validate_config(cfg, self._box.pin_names)
+            ok, err = validate_config(cfg, self._box.pin_names, self._analog_pins())
             if op == "validate_config":
                 if ok:
                     self._send({"ok": True, "valid": True})
