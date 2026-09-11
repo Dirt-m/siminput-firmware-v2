@@ -30,7 +30,14 @@ mc.on_next_reset = lambda *a: None
 mc.RunMode = types.SimpleNamespace(BOOTLOADER=None)
 sys.modules["microcontroller"] = mc
 sv = types.ModuleType("supervisor")
-sv.reload = lambda: (_ for _ in ()).throw(RuntimeError("RELOAD"))
+
+
+class Reload(BaseException):
+    """Mirrors CircuitPython's ReloadException, which derives from
+    BaseException so that `except Exception` guards never swallow a reboot."""
+
+
+sv.reload = lambda: (_ for _ in ()).throw(Reload("RELOAD"))
 sv.ticks_ms = lambda: int(__import__("time").monotonic() * 1000) % (1 << 29)
 sys.modules["supervisor"] = sv
 
@@ -287,7 +294,7 @@ while sent < len(raw):
     chunk = raw[sent:sent + 2048]
     try:
         r = send(h, {"chunk": base64.b64encode(chunk).decode(), "seq": seq})
-    except RuntimeError:
+    except Reload:
         reboot_hit = True
         break
     sent += len(chunk)
@@ -295,11 +302,20 @@ while sent < len(raw):
 if not reboot_hit:
     try:
         r = send(h, {"done": True})
-    except RuntimeError as e:
+    except Reload:
         reboot_hit = True
 check("chunked set_config wrote and rebooted", reboot_hit)
 check("config content on disk", json.load(open("config.json"))["device"]["name"] == "Chunky")
 check("no tmp litter", not os.path.exists("config.json.tmp"))
+
+# --- malformed ref inside a chunked config replies and releases the transfer -
+h_bad = mk_handler()
+bad_cfg = json.dumps({"rules": [{"type": "THRESHOLD", "input": ["D1"], "output": "B5", "above": 1}]}).encode()
+send(h_bad, {"cmd": "validate_config", "chunked": True, "size": len(bad_cfg)})
+send(h_bad, {"chunk": base64.b64encode(bad_cfg).decode(), "seq": 0})
+r = send(h_bad, {"done": True})
+check("chunked config with list ref gets an error reply", r and r[-1].get("ok") is False and r[-1].get("error"), r)
+check("handler released after malformed chunked config", send(h_bad, {"cmd": "ping"})[0].get("ok"))
 
 # --- oversized line recovery keeps the next command --------------------------
 h2 = mk_handler()

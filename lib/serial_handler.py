@@ -18,6 +18,8 @@ _MAX_CONFIG = 32768
 # Raw ADC samples in the stream are re-sent once any one moves by this much
 # (about 4 LSB of the 12-bit converter, i.e. its own noise floor).
 _ANALOG_STREAM_DELTA = 64
+_MAX_ANALOG_RULES = 16
+_MAX_THRESHOLD_RULES = 32
 
 # supervisor.ticks_ms wraps at 2**29; use ticks_diff for every comparison.
 # time.monotonic is unusable for firmware timing: CircuitPython floats are
@@ -68,7 +70,19 @@ def _is_int(v):
 
 def validate_config(cfg, pin_names, analog_pins=frozenset()):
     """Validate a config against this board's pin list. `analog_pins` is the
-    subset of pin_names that can be claimed as ADC inputs."""
+    subset of pin_names that can be claimed as ADC inputs.
+
+    Total: any shape of JSON yields (False, reason), never an exception. The
+    field checks below assume strings where refs are expected; a list or
+    object in such a slot would otherwise raise out of a set lookup, and on
+    the chunked path that used to wedge the transfer."""
+    try:
+        return _validate_config_inner(cfg, pin_names, analog_pins)
+    except Exception as e:
+        return False, "config malformed: " + str(e)
+
+
+def _validate_config_inner(cfg, pin_names, analog_pins):
     if not isinstance(cfg, dict):
         return False, "config must be a JSON object"
 
@@ -183,6 +197,8 @@ def validate_config(cfg, pin_names, analog_pins=frozenset()):
             return False, "pin '%s' is not analog capable on this board" % p
 
     def _valid_input(ref):
+        if not isinstance(ref, str):
+            return False
         if ref in analog_used:
             return False   # claimed as analog: it has no digital level to read
         if ref in pin_names:
@@ -193,7 +209,9 @@ def validate_config(cfg, pin_names, analog_pins=frozenset()):
         return ref in all_ids
 
     def _valid_output(ref):
-        if isinstance(ref, str) and ref.startswith("B") and ref[1:].isdigit():
+        if not isinstance(ref, str):
+            return False
+        if ref.startswith("B") and ref[1:].isdigit():
             n = int(ref[1:])
             return 1 <= n <= 127
         if ref == "REFRESH":
@@ -206,6 +224,16 @@ def validate_config(cfg, pin_names, analog_pins=frozenset()):
     analog_axes = {}
     stored_axes = {a["id"] for a in axes
                    if isinstance(a, dict) and "id" in a and a.get("store", False)}
+    # Each ANALOG rule costs a pipeline evaluation every 5 ms cycle and a
+    # curve table holds up to 32 points; cap both so a config cannot eat the
+    # cycle budget or the heap. Four ADC pins feeding eight axes plus a
+    # backlight is well inside these.
+    n_analog = sum(1 for r in rules if isinstance(r, dict) and r.get("type") == "ANALOG")
+    if n_analog > _MAX_ANALOG_RULES:
+        return False, "too many ANALOG rules (max %d)" % _MAX_ANALOG_RULES
+    n_thresh = sum(1 for r in rules if isinstance(r, dict) and r.get("type") == "THRESHOLD")
+    if n_thresh > _MAX_THRESHOLD_RULES:
+        return False, "too many THRESHOLD rules (max %d)" % _MAX_THRESHOLD_RULES
     for i, r in enumerate(rules):
         if isinstance(r, dict) and r.get("type") == "ANALOG":
             axis = r.get("axis", "")
@@ -346,7 +374,7 @@ def validate_config(cfg, pin_names, analog_pins=frozenset()):
                             return False, "rules[%d] ANALOG: curve point inputs must be strictly increasing" % i
                         last_x = p[0]
                 elif isinstance(curve, (int, float)) and not isinstance(curve, bool):
-                    if curve <= 0 or curve > 10:
+                    if not (0 < curve <= 10):   # also rejects NaN
                         return False, "rules[%d] ANALOG: curve exponent must be > 0 and <= 10" % i
                 else:
                     return False, "rules[%d] ANALOG: curve must be a number or a list of [in, out] points" % i
@@ -593,7 +621,13 @@ class SerialHandler:
 
         try:
             if self._chunk_op is not None:
-                self._handle_chunk_msg(msg)
+                # Guarded like command handlers: an exception here (a config
+                # shape the validator did not expect) must produce a reply
+                # and release the transfer, not wedge it until the timeout.
+                try:
+                    self._handle_chunk_msg(msg)
+                except Exception as e:
+                    self._abort_chunk("transfer failed: " + str(e))
                 return
 
             cmd = msg.get("cmd")

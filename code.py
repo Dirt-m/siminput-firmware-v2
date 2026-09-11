@@ -365,12 +365,21 @@ class ButtonBox:
                 except Exception as e:
                     # Fall through to a digital claim so the pin is at least
                     # owned. Rules that need it are dropped at parse time
-                    # (their axis keeps its default) and the box keeps running.
+                    # (their axis keeps its default) and the box keeps
+                    # running; the fault is reported over serial.
                     print("AnalogIn init failed for", name, e)
-            pin = digitalio.DigitalInOut(pin_obj)
-            pin.direction = digitalio.Direction.INPUT
-            pin.pull      = digitalio.Pull.UP
-            self.gpio_pins[name] = pin
+                    if not self.fault:
+                        self.fault = "analog_init:" + name
+            try:
+                pin = digitalio.DigitalInOut(pin_obj)
+                pin.direction = digitalio.Direction.INPUT
+                pin.pull      = digitalio.Pull.UP
+                self.gpio_pins[name] = pin
+            except Exception as e:
+                # Most likely the same "pin in use" that just failed the
+                # analog claim. An unowned pin reads as off; a dead box
+                # with no serial path would be far worse.
+                print("DigitalInOut init failed for", name, e)
         # Pins the debounced digital scan covers: everything except the
         # analog claims (an ADC pin has no meaningful on/off level).
         self._digital_pins = [(n, d) for n, d in self.pin_map.items()
@@ -590,9 +599,11 @@ class ButtonBox:
                 parsed = self._parse_threshold_rule(rule)
                 if parsed is not None:
                     self.threshold_cfg[i] = parsed
-                    out = rule.get("output", "")
-                    if out.startswith("B") and out[1:].isdigit():
-                        self.claimed_b.add(int(out[1:]))
+                # Claimed even when the rule is unusable: failing open would
+                # hand the button back to default passthrough of a D-pin.
+                out = rule.get("output", "")
+                if out.startswith("B") and out[1:].isdigit():
+                    self.claimed_b.add(int(out[1:]))
             else:
                 out = rule.get("output", "")
                 if out.startswith("B") and out[1:].isdigit():
@@ -668,6 +679,12 @@ class ButtonBox:
         chains through one level of forward references.
         """
         for _ in range(2):
+            # Cold-start every threshold latch per pass: pass 1 may compare
+            # against an axis default that a later ANALOG rule overwrites,
+            # and a latch armed on that stale value would hold through pass 2
+            # (and then forever, via hysteresis).
+            for i in self.threshold_cfg:
+                self.rule_prev_input[i] = False
             for i, rule in enumerate(self.rules):
                 rtype = rule.get("type", "")
                 if rtype == "ANALOG":
@@ -716,9 +733,22 @@ class ButtonBox:
     def _int_in(value, default, lo, hi):
         try:
             v = int(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            # OverflowError: int(inf). CircuitPython floats are single
+            # precision, so any literal above ~3.4e38 parses as inf.
             return default
         return max(lo, min(hi, v))
+
+    @staticmethod
+    def _muldiv(a, b, c):
+        """a * b // c for 0 <= a, b <= 65535 and 0 < c <= 65535 without any
+        intermediate above 2**30: on 32-bit CircuitPython a product past
+        MP_SMALL_INT_MAX is promoted to a heap bignum, which would be one
+        allocation per ANALOG rule per cycle for most of a pot's travel."""
+        bh = b >> 8
+        q  = (a * bh) // c
+        r  = a * bh - q * c
+        return q * 256 + (r * 256 + a * (b & 0xFF)) // c
 
     def _parse_analog_rule(self, rule):
         """Return the runtime tuple for an ANALOG rule, or None if unusable.
@@ -740,7 +770,7 @@ class ButtonBox:
             if not (lo < center - dz and center + dz < hi):
                 return None
         filt = self._int_in(rule.get("filter", 2), 2, 0, 8)
-        hyst = self._int_in(rule.get("hysteresis", 0), 0, 0, 65535)
+        hyst = self._int_in(rule.get("hysteresis", 64), 64, 0, 65535)
 
         # curve: a number is an exponent on the normalised value (1 = linear),
         # a list of [in, out] points is a piecewise-linear table over 0-65535.
@@ -751,10 +781,14 @@ class ButtonBox:
             pts = []
             for p in curve:
                 try:
-                    pts.append((int(p[0]), int(p[1])))
+                    x = self._int_in(p[0], -1, 0, 65535)
+                    y = self._int_in(p[1], -1, 0, 65535)
                 except Exception:
+                    x = y = -1
+                if x < 0 or y < 0:
                     pts = []
                     break
+                pts.append((x, y))
             if len(pts) >= 2:
                 pts.sort()
                 curve_tab = tuple(pts)
@@ -787,7 +821,7 @@ class ButtonBox:
             return None
         if thr < 0:
             return None
-        hyst = self._int_in(rule.get("hysteresis", 0), 0, 0, 65535)
+        hyst = self._int_in(rule.get("hysteresis", 256), 256, 0, 65535)
         return (is_pin, src, thr, hyst, above, bool(rule.get("invert", False)))
 
     def _read_analog(self):
@@ -824,7 +858,7 @@ class ButtonBox:
                 out = 0
             else:
                 span = hi - lo
-                out  = 65535 if x >= span else (x * 65535) // span
+                out  = 65535 if x >= span else self._muldiv(x, 65535, span)
             if invert:
                 out = 65535 - out
         else:
@@ -844,25 +878,30 @@ class ButtonBox:
             elif d >= span:
                 out = 65535 if up else 0
             elif up:
-                out = 32767 + (d * 32768) // span
+                out = 32767 + self._muldiv(d, 32768, span)
             else:
-                out = 32767 - (d * 32767) // span
+                out = 32767 - self._muldiv(d, 32767, span)
 
         if curve_exp:
             if center is None:
                 out = int((out / 65535.0) ** curve_exp * 65535.0 + 0.5)
             else:
+                # Each half normalised by its own span (32768 up, 32767
+                # down) so full deflection still lands exactly on the rail.
                 d = out - 32767
-                m = int((abs(d) / 32767.0) ** curve_exp * 32767.0 + 0.5)
+                half = 32768.0 if d >= 0 else 32767.0
+                m = int((abs(d) / half) ** curve_exp * half + 0.5)
                 out = 32767 + m if d >= 0 else 32767 - m
             out = max(0, min(65535, out))
         elif curve_tab is not None:
             out = self._apply_curve_table(curve_tab, out)
 
         # Hysteresis: ignore output wobble smaller than `hyst`, except at the
-        # rails so a pedal still rests at exactly 0 or 65535.
+        # rails (a pedal must rest at exactly 0 or 65535) and at the exact
+        # centre of a centered axis (a stick must return to exactly 32767).
         last = state[1]
-        if hyst and last >= 0 and 0 < out < 65535 and abs(out - last) < hyst:
+        if (hyst and last >= 0 and 0 < out < 65535 and abs(out - last) < hyst
+                and not (out == 32767 and center is not None)):
             out = last
         state[1] = out
         return out
@@ -880,7 +919,11 @@ class ButtonBox:
                 x0, y0 = pts[k - 1]
                 if x1 == x0:
                     return y1
-                return max(0, min(65535, y0 + ((x - x0) * (y1 - y0)) // (x1 - x0)))
+                # Points are clamped to 0-65535 at parse time, so the
+                # small-int _muldiv is safe; a falling segment is mirrored.
+                if y1 >= y0:
+                    return y0 + ButtonBox._muldiv(x - x0, y1 - y0, x1 - x0)
+                return y0 - ButtonBox._muldiv(x - x0, y0 - y1, x1 - x0)
         return pts[n - 1][1]
 
     def _eval_threshold(self, i):
@@ -889,10 +932,13 @@ class ButtonBox:
         is_pin, src, thr, hyst, above, invert = self.threshold_cfg[i]
         value = self.analog_raw.get(src, 0) if is_pin else self.axis_states.get(src, 32767)
         prev  = self.rule_prev_input[i]
+        # Both comparisons are inclusive: with hysteresis 0 they must agree
+        # at value == thr, or a source parked exactly on the level (a pedal
+        # clamped to 0 with "below": 0) flips the output every cycle.
         if above:
-            on = value > thr - hyst if prev else value >= thr
+            on = value >= thr - hyst if prev else value >= thr
         else:
-            on = value < thr + hyst if prev else value <= thr
+            on = value <= thr + hyst if prev else value <= thr
         self.rule_prev_input[i] = on
         return (not on) if invert else on
 
