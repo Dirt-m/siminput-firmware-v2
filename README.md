@@ -174,13 +174,13 @@ A centered sensor (steering, a joystick axis) gets a `center` and a `deadzone` a
 | `center` | none | Raw reading that maps to 32767. Must lie between `min` and `max` |
 | `deadzone` | 0 | Raw counts either side of `center` that read as centered. Needs `center` |
 | `invert` | false | Flip direction (mirrors about the center when one is set) |
-| `filter` | 2 | Exponential smoothing, 0 to 8. Time constant is about 2^n cycles at 200 Hz, so 2 is 20 ms and 5 is 160 ms. 0 disables it |
-| `hysteresis` | 0 | Ignore output changes smaller than this, except at the ends of the range. Useful to keep a noisy sensor from sending reports at 200 Hz |
+| `filter` | 2 | Exponential smoothing, 0 to 8. Time constant is about 2^n cycles at 200 Hz, so 2 is 20 ms and 5 is 160 ms. A full swing settles in about 12 cycles at 2, 130 at 4, and over 2000 (10 s) at 8, so keep pedals and steering at 4 or below. 0 disables it |
+| `hysteresis` | 64 | Ignore output changes smaller than this, except at the ends of the range and at the exact centre of a centered axis. The default swallows the ADC's own dither so an idle sensor stops sending HID reports; 0 disables it |
 | `curve` | 1 | A number is an exponent on the normalised value: above 1 softens the start of travel, below 1 sharpens it. On a centered axis it applies to each side. A list of `[in, out]` points (2 to 32, inputs strictly increasing) is a piecewise linear table over 0 to 65535 for sensors with a known nonlinearity |
 
-The RP2040 ADC is 12 bit and noisy by a few counts (a few hundred in 16 bit terms). The default filter takes most of that out; add `hysteresis` if the axis still jitters in games.
+The RP2040 ADC is 12 bit and noisy by a few counts (a few hundred in 16 bit terms). The default filter and hysteresis take that out; raise `hysteresis` if the axis still jitters in games. A `curve` given as a table costs less per cycle than an exponent, which needs a floating point power every cycle.
 
-THRESHOLD makes a button out of an analog signal. The input is either an A-pin (compared against the raw sample, unfiltered) or an axis id (compared against its current value, so a filtered ANALOG axis or an encoder driven axis both work). Set exactly one of `above` or `below`. `hysteresis` is how far the value has to come back before the output drops again. The output is a normal rule output, so it can feed TOGGLE, PULSE, or a bool:
+THRESHOLD makes a button out of an analog signal. The input is either an A-pin (compared against the raw sample, unfiltered) or an axis id (compared against its current value, so a filtered ANALOG axis or an encoder driven axis both work). Set exactly one of `above` or `below`. `hysteresis` (default 256) is how far the value has to come back before the output drops again; a raw pin carries the ADC noise unfiltered, so do not set it to 0 on a pin unless the source is clean, or compare against a filtered axis instead. The output is a normal rule output, so it can feed TOGGLE, PULSE, or a bool:
 
 ```json
 { "type": "THRESHOLD", "input": "A4", "output": "B40", "above": 30000, "hysteresis": 1500 },

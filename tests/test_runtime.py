@@ -180,7 +180,7 @@ CONFIG = {
          "center": 30000, "deadzone": 1000, "filter": 0, "invert": True},
         # A3 feeds two axes: exponent curve and a point table (filtered).
         {"type": "ANALOG", "input": "A3", "axis": "CURVED", "curve": 2, "filter": 0},
-        {"type": "ANALOG", "input": "A3", "axis": "TABLED", "filter": 3,
+        {"type": "ANALOG", "input": "A3", "axis": "TABLED", "filter": 3, "hysteresis": 0,
          "curve": [[0, 0], [32768, 8192], [65535, 65535]]},
         # THRESHOLD on a raw pin and on a processed axis, chained into a TOGGLE.
         {"type": "THRESHOLD", "input": "A1", "output": "B60", "above": 40000, "hysteresis": 2000},
@@ -472,6 +472,79 @@ r = validate([{"type": "ANALOG", "input": "A1", "axis": "AX", "min": 1000, "max"
                "center": 30000, "deadzone": 500, "filter": 4, "hysteresis": 32,
                "curve": [[0, 0], [32767, 32767], [65535, 65535]], "invert": True}])
 check("full ANALOG rule valid", r.get("valid") is True, r)
+r = validate([{"type": "THRESHOLD", "input": ["A1"], "output": "B3", "above": 1}])
+check("list where a ref belongs: error, not exception", r.get("ok") is False and "error" in r, r)
+r = validate([{"type": "ANALOG", "input": "A1", "axis": "AX", "curve": float("nan")}])
+check("NaN curve rejected", "exponent" in r.get("error", ""), r)
+r = validate([{"type": "ANALOG", "input": "A1", "axis": "AX"}] * 17)
+check("ANALOG rule count capped", "too many ANALOG" in r.get("error", ""), r)
+
+# ---- review regressions: helpers ------------------------------------------
+import random as _random
+_rng = _random.Random(7)
+ok = True
+for _ in range(20000):
+    a, b, c = _rng.randint(0, 65535), _rng.randint(0, 65535), _rng.randint(1, 65535)
+    if module.ButtonBox._muldiv(a, b, c) != a * b // c:
+        ok = False
+        break
+check("_muldiv matches a*b//c (small-int safe)", ok, (a, b, c))
+check("_int_in swallows inf", module.ButtonBox._int_in(float("inf"), 5, 0, 10) == 5)
+
+# ---- review regressions: second box with adversarial ordering --------------
+# THRESHOLD placed before the ANALOG rule that drives its axis, sensor below
+# the level at boot; a threshold on a raw pin parked exactly on its level with
+# hysteresis 0; a THRESHOLD whose input is unusable (hand-edited) still claims
+# its button; a hand-edited curve table with out-of-range points.
+CONFIG2 = {
+    "device": {"name": "RuntimeTest2", "pid": 0xF004, "debounce_ms": 0,
+               "inactivity_refresh": False},
+    "bools": [],
+    "axes": [{"id": "THR", "output": 1, "default": 32767},
+             {"id": "CEN", "output": 2},
+             {"id": "TAB", "output": 3}],
+    "rules": [
+        {"type": "THRESHOLD", "input": "THR", "output": "B60", "above": 20000, "hysteresis": 5000},
+        {"type": "ANALOG", "input": "A1", "axis": "THR", "filter": 0, "hysteresis": 0},
+        {"type": "THRESHOLD", "input": "A2", "output": "B61", "above": 40000, "hysteresis": 0},
+        {"type": "THRESHOLD", "input": "D9", "output": "B5", "above": 1},
+        {"type": "ANALOG", "input": "A3", "axis": "CEN", "center": 32767, "curve": 0.5,
+         "filter": 0, "hysteresis": 64},
+        {"type": "ANALOG", "input": "A4", "axis": "TAB", "filter": 0, "hysteresis": 0,
+         "curve": [[0, -500], [65535, 200000]]},
+    ],
+}
+with open("config.json", "w") as f:
+    json.dump(CONFIG2, f)
+ADC_LEVELS.clear()
+ADC_LEVELS[A1] = 17000     # below 20000, inside the 5000 hysteresis band
+ADC_LEVELS[A2] = 40000     # exactly on the level
+ADC_LEVELS[A4] = 0
+box2 = module.ButtonBox()
+check("boot: threshold before its analog rule seeds from the sensor, not the axis default",
+      box2.b_states.get(60) is False, box2.b_states.get(60))
+flips = []
+for _ in range(8):
+    box2.update()
+    flips.append(box2.b_states.get(61))
+check("threshold parked on its level does not chatter", all(flips), flips)
+check("unusable THRESHOLD still claims its button", 5 in box2.claimed_b)
+PIN_LEVELS[f"GP{box2.pin_map['D5']['pin']}"] = True
+box2.update(); box2.update()
+check("claimed button does not fall open to passthrough", box2.b_states.get(5) is not True)
+PIN_LEVELS[f"GP{box2.pin_map['D5']['pin']}"] = False
+check("hand-edited curve endpoints clamped", box2.axis_states["TAB"] == 0, box2.axis_states["TAB"])
+ADC_LEVELS[A4] = 65535; box2.update(); box2.update()
+check("hand-edited curve top endpoint clamped", box2.axis_states["TAB"] == 65535, box2.axis_states["TAB"])
+ADC_LEVELS[A3] = 65535; box2.update(); box2.update()
+check("centered axis with exponent 0.5 reaches the top rail", box2.axis_states["CEN"] == 65535,
+      box2.axis_states["CEN"])
+ADC_LEVELS[A3] = 0; box2.update(); box2.update()
+check("centered axis with exponent 0.5 reaches the bottom rail", box2.axis_states["CEN"] == 0)
+for lvl in (20000, 30000, 32000, 32700, 32767):
+    ADC_LEVELS[A3] = lvl; box2.update()
+check("centered axis returns to exact centre through hysteresis", box2.axis_states["CEN"] == 32767,
+      box2.axis_states["CEN"])
 
 print("\n%d passed, %d failed" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)
