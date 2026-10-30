@@ -36,6 +36,7 @@ code.py              Main firmware: init, config parsing, rule engine, HID loop
 config.json          Default device config (minimal, pure passthrough)
 build-package.sh     Builds the firmware update ZIP
 configs/
+  config.json           Blank starting config (no inputs, axes, or rules)
   config-example.json   Example config demonstrating every rule type
 lib/
   serial_handler.py     Serial command handler (JSON over CDC)
